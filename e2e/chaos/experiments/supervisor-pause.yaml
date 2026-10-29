@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: supervisor-pause
+version: 2
+title: A workload runs to completion while its supervisor is frozen
+hypothesis: >
+  While the supervisor of every counter instance is frozen for 10s, each
+  counter script, which makes no network calls, runs to completion without
+  being started again. When the flow ends, no supervisor is still frozen.
+description: >
+  Two counter instances run. 10s after both have been observed running,
+  pause-supervisors freezes every process of each instance's supervisor for
+  10s. The counter scripts write only local files, so the freeze should not
+  affect them. The adapter's checks confirm that the supervisors were
+  thawed. The checks encode desired behaviour.
+default-adapter: openshell-docker
+timeout: 10m
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 2
+    timeout: 3m
+    env: {TICKS: "45", INTERVAL: "1"}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has the ticks 1 to $TICKS,
+          each once and in order, so no tick was skipped or repeated.
+        kind: shell
+        run: |
+          journal=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal
+          if ! diff=$(diff <(seq 1 "$TICKS") <(cut -d" " -f1 "$journal")); then
+            echo "$diff" | head -5
+            echo "want the ticks 1 to $TICKS, each once, in order"
+            exit 1
+          fi
+      - name: started-once
+        description: >
+          For each counter instance: .chaos/attempts has exactly 1 line, so
+          the script ran once and was not started again.
+        kind: shell
+        run: |
+          n=$(wc -l < "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/.chaos/attempts")
+          [ "$n" -eq 1 ] || { echo "want 1 attempt, got $n"; exit 1; }
+
+operations:
+  - name: pause-supervisors
+    description: >
+      Freezes the supervisor of every counter instance, keeps it frozen for
+      10s, then thaws it and records operation.reverted.
+    uses: freeze
+    target: {workload: counter, role: supervisor}
+    select: all
+    duration: 10s
+
+flow:
+  parallel:
+    - counter
+    - serial: [{wait: {workload: counter, condition: started}}, {delay: 10s}, pause-supervisors]
+
+checks:
+  - name: all-supervisors-connected
+    description: >
+      At some scrape all 2 counter instances had their supervisor session
+      registered on the gateway, so the metric saw the full workload.
+    kind: metric
+    metric: openshell_server_supervisor_sessions
+    value: max
+    at-least: 2
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_relay_pending
+    description: >
+      Relay channels waiting for a supervisor to connect back. A killed or
+      paused supervisor leaves its channel pending until it returns or the
+      channel expires.
+  - family: openshell_server_routed_request_attempts_total
+    description: >
+      Relay setup and outbound peer attempts, each retry counted. Requests to
+      a sandbox whose supervisor is gone retry here before they fail.
+  - family: openshell_server_relay_expired_total
+    description: >
+      Pending relay channels dropped because the supervisor did not connect
+      back in time.

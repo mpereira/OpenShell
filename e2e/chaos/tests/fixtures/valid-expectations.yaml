@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: valid-expectations
+version: 1
+title: t
+hypothesis: h
+description: d
+default-adapter: openshell-docker
+expectations:
+  - {issue: NVIDIA/OpenShell#1, checks: [w/ok], instances: affected, kind: flaky}
+  - {issue: NVIDIA/OpenShell#2, checks: [experiment/e]}
+workloads:
+  - name: w
+    description: d
+    kind: shell
+    instances: 2
+    timeout: 1m
+    run: "true"
+    checks: [{name: ok, description: d, kind: exit-code, equals: 0}]
+checks:
+  - {name: e, description: d, kind: shell, run: "true"}
+operations:
+  - {name: a, description: d, uses: openshell-sandbox-restart, target: {workload: w}, select: one}
+flow: {parallel: [w, {serial: [{wait: {workload: w, condition: started}}, a]}]}

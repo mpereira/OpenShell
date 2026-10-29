@@ -1,0 +1,214 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: policy-tighten-survives-gateway-restart
+version: 3
+title: A tightened policy stays in effect across a gateway restart
+hypothesis: >
+  After a running sandbox's policy is changed to deny one of two hosts it
+  could reach, connections to that host are denied from then on, including
+  after the gateway is killed and started again, and connections to the other
+  host are never denied.
+description: >
+  One fetcher instance starts with policy open, which allows TCP to $ALLOWED
+  and $DENIED on port 443. 10s after it is running, tighten sets policy tight,
+  which allows only $ALLOWED. 10s later gateway-down kills the gateway for
+  10s. The fetcher probes both hosts about once a second throughout. A connect that
+  fails with EACCES or EPERM is a policy denial; success, a timeout or any
+  other error is not, so the experiment does not need internet access.
+default-adapter: openshell-docker
+timeout: 10m
+expectations:
+  - issue: NVIDIA/OpenShell#4910
+    # The restarted gateway replaces the live supervisor, the sandbox runtime
+    # rejects the replacement, and the driver stops the sandbox container about
+    # 10s after the gateway is back.
+    checks: [fetcher/exited-ok, fetcher/denied-only-after-tighten]
+
+# OpenShell policies, named by the workload's policy option and tighten.
+data:
+  open:
+    version: 1
+    filesystem_policy:
+      include_workdir: true
+      read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+      read_write: [/sandbox, /tmp, /dev/null]
+    landlock: {compatibility: best_effort}
+    network_policies:
+      allowed:
+        name: allowed
+        endpoints: [{host: 1.1.1.1, port: 443}]
+        binaries: [{path: "/**"}]
+      tightened:
+        name: tightened
+        endpoints: [{host: 1.0.0.1, port: 443}]
+        binaries: [{path: "/**"}]
+  tight:
+    version: 1
+    filesystem_policy:
+      include_workdir: true
+      read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+      read_write: [/sandbox, /tmp, /dev/null]
+    landlock: {compatibility: best_effort}
+    network_policies:
+      allowed:
+        name: allowed
+        endpoints: [{host: 1.1.1.1, port: 443}]
+        binaries: [{path: "/**"}]
+
+workloads:
+  - name: fetcher
+    description: >
+      For $SECONDS_TO_RUN seconds, about once a second, opens a TCP connection to
+      $ALLOWED:443 and to $DENIED:443 with a 1s timeout. Each attempt appends
+      the line "<unix time> <host> <errno>" to the instance's journal, where
+      errno is 0 on success and -1 on a timeout.
+    kind: shell
+    instances: 1
+    timeout: 5m
+    env: {ALLOWED: 1.1.1.1, DENIED: 1.0.0.1, SECONDS_TO_RUN: "120"}
+    options: {policy: open, restart-policy: never}
+    run: |
+      # The sandbox image has perl-base but no python3, curl or Time::HiRes.
+      exec perl <<'EOF'
+      use strict;
+      use Socket;
+
+      my $journal = "$ENV{CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR}/journal";
+      my @hosts = ($ENV{ALLOWED}, $ENV{DENIED});
+      my $end = time + $ENV{SECONDS_TO_RUN};
+      while (time < $end) {
+          for my $host (@hosts) {
+              socket(my $sock, PF_INET, SOCK_STREAM, 0) or die "socket: $!";
+              my $code = 0;
+              eval {
+                  local $SIG{ALRM} = sub { die "timeout\n" };
+                  alarm 1;
+                  connect($sock, pack_sockaddr_in(443, inet_aton($host))) or $code = $! + 0;
+                  alarm 0;
+              };
+              $code = -1 if $@ eq "timeout\n";
+              close $sock;
+              open(my $f, ">>", $journal) or die "$journal: $!";
+              printf $f "%d %s %d\n", time, $host, $code;
+              close $f;
+          }
+          sleep 1;
+      }
+      EOF
+    checks:
+      - name: exited-ok
+        description: >
+          For the fetcher instance: the last attempt of the script exited
+          with code 0.
+        kind: exit-code
+        equals: 0
+      - name: allowed-never-denied
+        description: >
+          No connection to $ALLOWED failed with EACCES (13) or EPERM (1), and
+          the journal has at least 30 attempts to it.
+        kind: shell
+        run: |
+          awk -v h="$ALLOWED" '
+            $2 == h { n++; if ($3 == 13 || $3 == 1) { print "denied at " $1; bad = 1 } }
+            END { if (n < 30) { print "only " n+0 " attempts"; bad = 1 } exit bad }
+          ' "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal"
+      - name: denied-only-after-tighten
+        description: >
+          Connections to $DENIED were not denied before operation.started
+          for tighten, and every one that started at least 3s after
+          operation.completed for tighten was denied, up to the end of the
+          journal. At least 5 attempts started 3s or more after
+          operation.reverted for gateway-down.
+        kind: shell
+        run: |
+          at() {
+            # Slurp: jq 1.6 -e only looks at the last line of a stream.
+            jq -sr --arg e "$1" --arg o "$2" '
+              map(select(.event == $e and .operation == $o))[0].ts // empty
+              | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601
+            ' "$CHAOS_EXPERIMENT_RUN_DIR/timeline.jsonl"
+          }
+          started=$(at operation.started tighten)
+          applied=$(at operation.completed tighten)
+          recovered=$(at operation.reverted gateway-down)
+          if [ -z "$started" ] || [ -z "$applied" ] || [ -z "$recovered" ]; then
+            echo "missing events: started=$started applied=$applied recovered=$recovered"
+            exit 1
+          fi
+          awk -v h="$DENIED" -v s="$started" -v a="$applied" -v r="$recovered" '
+            $2 != h { next }
+            { denied = ($3 == 13 || $3 == 1) }
+            $1 < s && denied { print "denied before tighten at " $1; bad = 1 }
+            $1 >= a + 3 && !denied { print "not denied after tighten at " $1 " (errno " $3 ")"; bad = 1 }
+            $1 >= r + 3 { after++ }
+            END { if (after < 5) { print "only " after+0 " attempts after recovery"; bad = 1 } exit bad }
+          ' "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal"
+
+operations:
+  - name: tighten
+    description: >
+      Sets policy tight on the fetcher instance's sandbox and returns once the
+      sandbox reports it loaded (`openshell policy set --wait`).
+    uses: openshell-policy-set
+    options: {policy: tight}
+    target: {workload: fetcher}
+    select: all
+
+  - name: gateway-down
+    description: >
+      Sends SIGKILL to the gateway process and keeps it stopped for 10s. Then
+      runs the adapter's start hook, which waits up to 120s until the
+      gateway's /healthz returns 200, and records operation.reverted.
+    uses: outage
+    target: gateway
+    select: one
+    duration: 10s
+
+flow:
+  parallel:
+    - fetcher
+    - serial:
+        - wait: {workload: fetcher, condition: started}
+        - delay: 10s
+        - tighten
+        - delay: 10s
+        - gateway-down
+
+checks:
+  - name: gateway-recovered
+    description: >
+      The timeline has an operation.reverted event for gateway-down. The harness
+      records it only after the restarted gateway answered /healthz with 200.
+    kind: shell
+    env: {OPERATION: gateway-down}
+    run: |
+      jq -se --arg o "$OPERATION" 'any(.[]; .event == "operation.reverted" and .operation == $o)' \
+        "$CHAOS_EXPERIMENT_RUN_DIR/timeline.jsonl" > /dev/null \
+        || { echo "$OPERATION was never reverted"; exit 1; }
+  - name: database-healthy-after-restart
+    description: >
+      The gateway's database readiness probe passed in the last scrape of the
+      run, after the restart.
+    kind: metric
+    metric: openshell_server_readiness_database_healthy
+    value: last
+    equals: 1
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_readiness_database_healthy
+    description: >
+      1 while the gateway's database probe passes. The gateway restarts with
+      its database; a 0 after the restart would mean the gateway came back
+      before its state did.
+  - family: openshell_supervisor_policy_apply_results_total
+    description: >
+      Policy applies the supervisors reported, by outcome. A sandbox that
+      reconnects to the restarted gateway applies its policy again, so the
+      counter steps once per surviving sandbox.

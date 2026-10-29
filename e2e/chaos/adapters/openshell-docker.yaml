@@ -1,0 +1,540 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell on the Docker compute driver, run under e2e/with-docker-gateway.sh.
+apiVersion: chaos/v1alpha1
+id: openshell-docker
+backend: docker
+# What `openshell sandbox create` accepts: each `--env` value and each command
+# argument (crates/openshell-cli/src/main.rs). An experiment over a limit is
+# rejected by `chaos validate` and `chaos run` before anything starts.
+limits:
+  env-value-bytes: 8192
+  run-script-bytes: 28672
+requires-env:
+  - OPENSHELL_BIN
+  - OPENSHELL_GATEWAY
+  - OPENSHELL_E2E_SANDBOX_NAMESPACE
+  - OPENSHELL_E2E_GATEWAY_BIN
+  - OPENSHELL_E2E_GATEWAY_ARGS_FILE
+  - OPENSHELL_E2E_GATEWAY_LOG
+  - OPENSHELL_E2E_GATEWAY_PID_FILE
+  - OPENSHELL_E2E_METRICS_PORT
+  # The gateway exports its spans over OTLP/gRPC to this port on 127.0.0.1;
+  # the `otel` watch receives them. The e2e wrapper sets it when
+  # OPENSHELL_E2E_GATEWAY_OTLP=1, which `mise run e2e:chaos` does.
+  - OPENSHELL_E2E_OTLP_PORT
+
+# Run before setup and before any instance is created; a failure ends the run
+# with ERROR. `chaos preflight` runs only these.
+preflight:
+  - name: docker-reachable
+    description: The Docker daemon answers `docker info`.
+    kind: shell
+    timeout: 30s
+    run: docker info --format '{{.ServerVersion}}'
+  - name: pull-otel-collector-image
+    description: >
+      The OpenTelemetry Collector image the `otel` watch runs is present,
+      pulled by this step when it is not; the step prints the pull command it
+      ran, so the one host-changing side effect of preflight is in the run.
+    kind: shell
+    timeout: 5m
+    run: |
+      image=otel/opentelemetry-collector:0.120.0
+      if docker image inspect "$image" >/dev/null 2>&1; then
+        echo "$image is present"
+      else
+        echo "+ docker pull --quiet $image"
+        docker pull --quiet "$image"
+      fi
+  - name: disk-space
+    description: The file system holding the run dir has at least 5 GiB free.
+    kind: shell
+    run: |
+      free_kb=$(df -Pk "$CHAOS_EXPERIMENT_RUN_DIR" | awk 'NR == 2 {print $4}')
+      echo "$((free_kb / 1024 / 1024)) GiB free"
+      [ "$free_kb" -ge $((5 * 1024 * 1024)) ]
+  - name: images-present
+    description: >
+      The sandbox, sandbox runtime and supervisor images named in the gateway
+      config are present locally.
+    kind: shell
+    run: |
+      config=
+      prev=
+      while IFS= read -r -d '' a; do
+        [ "$prev" = "--config" ] && config=$a
+        prev=$a
+      done < "$OPENSHELL_E2E_GATEWAY_ARGS_FILE"
+      [ -n "$config" ] || { echo "no --config in the gateway args"; exit 1; }
+      images=$(sed -nE 's/^(default_image|sandbox_runtime_image|supervisor_image) = "(.*)"$/\2/p' "$config" | sort -u)
+      [ -n "$images" ] || { echo "no images in $config"; exit 1; }
+      status=0
+      for image in $images; do
+        if docker image inspect "$image" > /dev/null 2>&1; then
+          echo "ok $image"
+        else
+          echo "missing $image"
+          status=1
+        fi
+      done
+      exit "$status"
+  - name: cli-runs
+    description: The OpenShell CLI under test runs.
+    kind: shell
+    run: '"$OPENSHELL_BIN" --version'
+  - name: jq-installed
+    description: jq, which the hooks and checks use, is installed.
+    kind: shell
+    run: command -v jq
+  - name: gateway-up
+    description: The gateway's /healthz returns HTTP 200.
+    kind: shell
+    run: |
+      port=
+      prev=
+      while IFS= read -r -d '' a; do
+        [ "$prev" = "--health-port" ] && port=$a
+        prev=$a
+      done < "$OPENSHELL_E2E_GATEWAY_ARGS_FILE"
+      code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port:-0}/healthz" || true)
+      echo "HTTP $code"
+      [ "$code" = 200 ]
+
+# Runs after preflight and prints one JSON object about the system under test,
+# recorded verbatim in manifest.json as `environment.system`: the CLI under
+# test, the gateway binary, the images the gateway config names, the git
+# commit the gateway binary was built from, and the Docker server.
+describe: |
+  config=
+  prev=
+  while IFS= read -r -d '' a; do
+    [ "$prev" = "--config" ] && config=$a
+    prev=$a
+  done < "$OPENSHELL_E2E_GATEWAY_ARGS_FILE"
+  images='{}'
+  if [ -n "$config" ]; then
+    while IFS='=' read -r key image; do
+      [ -n "$key" ] || continue
+      id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) || id=unknown
+      images=$(jq --arg k "$key" --arg v "$image@$id" '. + {($k): $v}' <<< "$images")
+    done < <(sed -nE 's/^(default_image|sandbox_runtime_image|supervisor_image) = "(.*)"$/\1=\2/p' "$config")
+  fi
+  # The checkout the gateway binary was built in, if it is in one.
+  repo=$(git -C "$(dirname "$OPENSHELL_E2E_GATEWAY_BIN")" rev-parse --show-toplevel 2>/dev/null) || repo=
+  git_sha=unknown
+  git_dirty=false
+  if [ -n "$repo" ]; then
+    git_sha=$(git -C "$repo" rev-parse HEAD)
+    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+      git_dirty=true
+    fi
+  fi
+  jq -n \
+    --arg openshell "$("$OPENSHELL_BIN" --version 2>/dev/null | head -1)" \
+    --arg gateway_sha256 "$(shasum -a 256 "$OPENSHELL_E2E_GATEWAY_BIN" | cut -d' ' -f1)" \
+    --arg git_sha "$git_sha" --argjson git_dirty "$git_dirty" \
+    --arg docker "$(docker version --format '{{.Server.Version}}' 2>/dev/null)" \
+    --argjson images "$images" \
+    '{openshell: $openshell, gateway_sha256: $gateway_sha256, git_sha: $git_sha,
+      git_dirty: $git_dirty, docker: $docker, images: $images}'
+
+# Runs at the start of every hook below. Hooks are bash, run on the host with
+# the hook variables in REFERENCE.md.
+prelude: |
+  # shellcheck shell=bash
+  set -euo pipefail
+
+  os() {
+    "$OPENSHELL_BIN" "$@"
+  }
+
+  # Sandbox names are capped at 19 characters and must be DNS-1123 labels, so the
+  # instance name is not usable directly. This is deterministic per run and
+  # instance: c<run-id suffix>-<cksum of the instance name>.
+  sandbox_name() {
+    local sum
+    sum=$(printf '%s' "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME" | cksum | cut -d' ' -f1)
+    printf 'c%s-%s\n' "${CHAOS_EXPERIMENT_RUN_ID##*-}" "$sum"
+  }
+
+  # Prints the id of the instance's container with the given isolation role.
+  role_container() {
+    docker ps -a --no-trunc --format '{{.ID}}' \
+      --filter "label=openshell.ai/sandbox-id=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID" \
+      --filter "label=openshell.ai/isolation-role=$1" | head -n1
+  }
+
+  # Prints the gateway's --health-port from the arguments the e2e wrapper recorded.
+  health_port() {
+    local a prev=
+    while IFS= read -r -d '' a; do
+      [ "$prev" = "--health-port" ] && printf '%s\n' "$a"
+      prev=$a
+    done < "$OPENSHELL_E2E_GATEWAY_ARGS_FILE"
+  }
+
+options:
+  # Empty means the gateway's default sandbox image and policy. `policy`
+  # names an entry of the experiment's `data`.
+  image: {default: ""}
+  policy: {default: "", data: true}
+  restart-policy: {default: never, enum: [never, on-failure, always]}
+
+instance:
+  # Under the sandbox user's home. Survives a graceful gateway restart
+  # (gateway-graceful-restart, 2026-10-27).
+  output-dir: /sandbox/chaos-output
+  create: |
+    # Creates the instance's sandbox detached and prints the sandbox id. The id
+    # comes from `sandbox get`: `create --detach` prints no JSON when the main
+    # process has already finished by the time the watch sees the sandbox.
+
+    args=(sandbox create --name "$(sandbox_name)" --detach
+      --restart-policy "$CHAOS_EXPERIMENT_WORKLOAD_OPTION_RESTART_POLICY")
+    if [ -n "${CHAOS_EXPERIMENT_WORKLOAD_OPTION_IMAGE:-}" ]; then
+      args+=(--from "$CHAOS_EXPERIMENT_WORKLOAD_OPTION_IMAGE")
+    fi
+    if [ -n "${CHAOS_EXPERIMENT_WORKLOAD_OPTION_POLICY:-}" ]; then
+      args+=(--policy "$CHAOS_EXPERIMENT_WORKLOAD_OPTION_POLICY")
+    fi
+    while IFS= read -r line; do
+      [ -n "$line" ] && args+=(--env "$line")
+    done < "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_ENV_FILE"
+
+    wrapper=$(cat "$CHAOS_EXPERIMENT_WORKLOAD_WRAPPER_FILE")
+    script=$(cat "$CHAOS_EXPERIMENT_WORKLOAD_RUN_FILE")
+    os "${args[@]}" -- sh -c "$wrapper" chaos "$script" >&2
+    os sandbox get "$(sandbox_name)" -o json | jq -er .id
+  status: |
+    # Prints Pending|Running|Succeeded|Failed|Unknown for the instance's sandbox,
+    # followed by the gateway's Ready condition reason when it has one (such as
+    # ContainerExited, MainProcessFailed or ControlSupervisorExited), which the
+    # timeline records as the state's `reason`.
+    #
+    # Terminal states follow the CLI's own rule (run.rs has_main_process_result):
+    # Completed, Stopped or Error with a main-process exit code, where Error also
+    # needs Ready=False/MainProcessFailed. An Error with Ready=False/ContainerExited
+    # and no exit code is provisional (the supervisor may still restart), and an
+    # exit code while Starting is a restart in progress; neither is terminal.
+
+    os sandbox get "$(sandbox_name)" -o json | jq -r '
+      def ready_false(reason):
+        any(.conditions[]?; .type == "Ready"
+          and (.status | ascii_downcase) == "false" and .reason == reason);
+      (.phase // "") as $p | .exit_code as $code
+      | (if $p == "Ready" then "Running"
+        elif $code != null and ($p == "Completed" or $p == "Stopped"
+          or ($p == "Error" and ready_false("MainProcessFailed"))) then
+          (if $code == 0 then "Succeeded" else "Failed" end)
+        elif $p == "Completed" then "Succeeded"
+        elif $p == "Error" and $code == null and ready_false("ContainerExited") then "Unknown"
+        elif $p == "Error" then "Failed"
+        elif $p == "Provisioning" or $p == "Starting" or $p == "Unspecified" then "Pending"
+        else "Unknown" end) as $state
+      | [$state, (first(.conditions[]? | select(.type == "Ready") | .reason) // empty)]
+      | join(" ")'
+  collect: |
+    # Copies the instance output dir and container logs into the instance dir.
+    # Download goes through the gateway; if the sandbox is no longer reachable that
+    # way, docker cp reads the stopped container directly.
+
+    dir=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_DIR
+    mkdir -p "$dir/output" "$dir/logs"
+
+    if ! os sandbox download "$(sandbox_name)" "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR" "$dir/output"; then
+      cid=$(role_container sandbox)
+      if [ -z "$cid" ]; then
+        echo "no sandbox container for $CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID" >&2
+        exit 1
+      fi
+      docker cp "$cid:$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/." "$dir/output"
+    fi
+
+    for role in sandbox supervisor; do
+      cid=$(role_container "$role")
+      if [ -n "$cid" ]; then
+        docker logs --timestamps "$cid" > "$dir/logs/$role.log" 2>&1 || true
+      fi
+    done
+  delete: |
+    # Deletes the instance's sandbox. A sandbox that is already gone counts as deleted.
+
+    name=$(sandbox_name)
+    if out=$(os sandbox delete "$name" 2>&1); then
+      exit 0
+    fi
+    if ! os sandbox get "$name" -o json > /dev/null 2>&1 \
+      && grep -qi 'not found' <<< "$out"; then
+      exit 0
+    fi
+    echo "$out" >&2
+    exit 1
+
+targets:
+  gateway:
+    type: process
+    pid-file: ${OPENSHELL_E2E_GATEWAY_PID_FILE}
+    start: |
+      # Starts the e2e gateway again with the arguments the e2e wrapper recorded,
+      # rewrites the pid file and waits for /healthz. Does nothing but wait if the
+      # recorded gateway is still alive.
+
+      args=()
+      while IFS= read -r -d '' a; do
+        args+=("$a")
+      done < "$OPENSHELL_E2E_GATEWAY_ARGS_FILE"
+
+      port=$(health_port)
+      if [ -z "$port" ]; then
+        echo "no --health-port in $OPENSHELL_E2E_GATEWAY_ARGS_FILE" >&2
+        exit 1
+      fi
+
+      alive() {
+        local pid stat
+        pid=$(cat "$OPENSHELL_E2E_GATEWAY_PID_FILE" 2>/dev/null) || return 1
+        stat=$(ps -p "$pid" -o stat= 2>/dev/null) || return 1
+        [ -n "$stat" ] && [ "${stat#Z}" = "$stat" ]
+      }
+
+      if ! alive; then
+        nohup "$OPENSHELL_E2E_GATEWAY_BIN" "${args[@]}" < /dev/null >> "$OPENSHELL_E2E_GATEWAY_LOG" 2>&1 &
+        echo $! > "$OPENSHELL_E2E_GATEWAY_PID_FILE"
+      fi
+
+      for _ in $(seq 120); do
+        if curl -sf "http://127.0.0.1:$port/healthz" > /dev/null; then
+          exit 0
+        fi
+        if ! alive; then
+          echo "gateway exited during startup; see $OPENSHELL_E2E_GATEWAY_LOG" >&2
+          exit 1
+        fi
+        sleep 1
+      done
+      echo "gateway not healthy after 120s" >&2
+      exit 1
+  roles:
+    sandbox:
+      type: container
+      labels:
+        openshell.ai/sandbox-id: ${CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID}
+        openshell.ai/isolation-role: sandbox
+    supervisor:
+      type: container
+      labels:
+        openshell.ai/sandbox-id: ${CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID}
+        openshell.ai/isolation-role: supervisor
+
+# Operations an experiment can use beside the built-in faults. Each script
+# returns once the change is in effect.
+operations:
+  openshell-policy-set:
+    options:
+      # Names an entry of the experiment's `data`: an OpenShell policy.
+      policy: {data: true, required: true}
+    run: |
+      # Applies a policy and returns once the sandboxes report it loaded.
+      #
+      # instances scope: `policy set --wait` on the instance's sandbox.
+      # global scope: `policy set --global`, which has no --wait. For each running
+      # instance, wait until the gateway reports the global policy as the sandbox's
+      # source, then until the sandbox logs a reload with that policy's hash.
+
+      #
+      # Before the change it saves the policy in effect to the state dir for
+      # `revert`: the sandbox's active policy, or the stored global policy when
+      # there is one.
+
+      policy=$CHAOS_EXPERIMENT_OPERATION_OPTION_POLICY
+      state=$CHAOS_EXPERIMENT_OPERATION_STATE_DIR
+
+      if [ "$CHAOS_EXPERIMENT_OPERATION_SCOPE" = instances ]; then
+        os sandbox get "$(sandbox_name)" --policy-only > "$state/policy.yaml"
+        os policy set "$(sandbox_name)" --policy "$policy" --wait --timeout 60
+        echo ok > "$CHAOS_EXPERIMENT_OPERATION_OUTCOME_FILE"
+        exit 0
+      fi
+
+      # Prints nothing when no global policy was ever set.
+      os policy get --global --base -o json > "$state/before.json"
+      if jq -e '.policy != null' "$state/before.json" > /dev/null 2>&1; then
+        jq '.policy' "$state/before.json" > "$state/policy.json"
+      fi
+      os policy set --global --yes --policy "$policy"
+
+      deadline=$((SECONDS + 120))
+      # fd 3, so a command in the loop that reads stdin cannot consume the list.
+      while IFS= read -r -u 3 instance; do
+        [ -n "$instance" ] || continue
+        sandbox=$(CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME=$instance sandbox_name)
+        hash=
+        until [ -n "$hash" ]; do
+          hash=$(os settings get "$sandbox" --json 2> /dev/null \
+            | jq -r 'select(.policy_source == "global") | .policy_hash // empty' || true)
+          [ -n "$hash" ] && break
+          [ "$SECONDS" -lt "$deadline" ] || { echo "$instance: policy source never became global" >&2; exit 1; }
+          sleep 1
+        done
+        # Read the logs first: under pipefail, grep -q closing the pipe early would
+        # fail the pipeline even on a match.
+        until logs=$(os logs "$sandbox" --source sandbox -n 500 2> /dev/null) \
+          && grep -qF "Policy reloaded successfully (global) [policy_hash:$hash" <<< "$logs"; do
+          [ "$SECONDS" -lt "$deadline" ] || { echo "$instance: no global reload with hash $hash" >&2; exit 1; }
+          sleep 1
+        done
+        echo "$instance $sandbox $hash"
+      done 3< "$CHAOS_EXPERIMENT_OPERATION_INSTANCES_FILE"
+      echo ok > "$CHAOS_EXPERIMENT_OPERATION_OUTCOME_FILE"
+    revert: |
+      # Puts back the policy `run` saved. instances scope: sets the sandbox's
+      # previous active policy on it (as a sandbox policy, even when it came
+      # from the global one) and waits for the sandbox to load it. global scope:
+      # sets the previous global policy back, or deletes the global policy when
+      # there was none; it does not wait for the sandboxes to reload.
+
+      state=$CHAOS_EXPERIMENT_OPERATION_STATE_DIR
+
+      if [ "$CHAOS_EXPERIMENT_OPERATION_SCOPE" = instances ]; then
+        os policy set "$(sandbox_name)" --policy "$state/policy.yaml" --wait --timeout 60
+        exit 0
+      fi
+
+      if [ -f "$state/policy.json" ]; then
+        os policy set --global --yes --policy "$state/policy.json"
+      else
+        os policy delete --global --yes
+      fi
+  openshell-sandbox-restart:
+    options:
+      # Whole seconds. Before stopping, the hook sleeps a random time from 0 to
+      # this, drawn independently for each instance, so instances that one
+      # operation with `select: all` restarts together do not stop and start in
+      # step. Not seeded by --seed.
+      jitter: {default: "0"}
+    revert: none
+    reason: A stop and a start leave the sandbox as it was; there is nothing to put back.
+    run: |
+      # Stops the instance's sandbox, then starts it again; both commands wait for
+      # the phase they ask for. Writes the outcome, which shows in the
+      # operation.completed event, and prints the same line to the operation log
+      # for checks to read:
+      #
+      #   ok                       stop and start succeeded; the sandbox is Ready
+      #   skipped <phase>          the sandbox was not Ready, so it was left alone
+      #   failed stop-failed ...   sandbox stop failed, with its output
+      #   failed start-failed ...  sandbox stop succeeded, sandbox start failed
+      #
+      # A failed stop or start is a result for the experiment's checks, not a
+      # harness error, so the hook exits 0. Instances scope only.
+
+      outcome() {
+        printf '%s\n' "$*" > "$CHAOS_EXPERIMENT_OPERATION_OUTCOME_FILE"
+        printf '%s\n' "$*"
+      }
+
+      [ "$CHAOS_EXPERIMENT_OPERATION_SCOPE" = instances ] \
+        || { echo "openshell-sandbox-restart takes a target, not scope global" >&2; exit 1; }
+      jitter=$CHAOS_EXPERIMENT_OPERATION_OPTION_JITTER
+      if ! [[ "$jitter" =~ ^[0-9]+$ ]] || [ "$jitter" -gt 30 ]; then
+        echo "jitter must be whole seconds from 0 to 30, not '$jitter'" >&2
+        exit 1
+      fi
+      if [ "$jitter" -gt 0 ]; then
+        ms=$((RANDOM % (jitter * 1000 + 1)))
+        sleep "$((ms / 1000)).$(printf %03d $((ms % 1000)))"
+      fi
+      sandbox=$(sandbox_name)
+      phase=$(os sandbox get "$sandbox" -o json | jq -r '.phase // ""') || phase=unreadable
+      [ "$phase" = Ready ] || { outcome skipped "$phase"; exit 0; }
+      out=$(os sandbox stop "$sandbox" 2>&1) || { outcome failed "stop-failed $(tr '\n' ' ' <<< "$out")"; exit 0; }
+      out=$(os sandbox start "$sandbox" 2>&1) || { outcome failed "start-failed $(tr '\n' ' ' <<< "$out")"; exit 0; }
+      outcome ok
+
+collect: |
+  # Copies what the adapter checks read into the run dir. Must run before the e2e
+  # wrapper's cleanup deletes its work dir and the sandbox containers.
+
+  run=$CHAOS_EXPERIMENT_RUN_DIR
+  cp "$OPENSHELL_E2E_GATEWAY_LOG" "$run/logs/gateway.log" || true
+
+  # Give the gateway time to finish deleting containers before looking for leaks.
+  sleep 30
+
+  docker ps -a --no-trunc --format '{{json .}}' \
+    --filter "label=openshell.ai/managed-by=openshell" \
+    --filter "label=openshell.ai/sandbox-namespace=$OPENSHELL_E2E_SANDBOX_NAMESPACE" \
+    | jq -s 'map({id: .ID, names: .Names, state: .State, status: .Status, labels: .Labels})' \
+    > "$run/system/containers.json"
+
+  port=$(health_port)
+  code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port:-0}/healthz" || true)
+  jq -n --arg code "$code" '{http_code: ($code | tonumber? // 0)}' > "$run/system/healthz.json"
+
+# Recorded from the start of the flow until adapter collection ends. See
+# "Metrics and Grafana" in the README.
+metrics:
+  - name: gateway
+    url: http://127.0.0.1:${OPENSHELL_E2E_METRICS_PORT}/metrics
+    interval: 2s
+watch:
+  - name: docker-events
+    run: >-
+      exec docker events --format '{{json .}}'
+      --filter "label=openshell.ai/sandbox-namespace=$OPENSHELL_E2E_SANDBOX_NAMESPACE"
+  # An OpenTelemetry Collector that prints every gateway span it receives. The
+  # debug exporter writes to stderr, so 2>&1 brings the span lines to stdout.
+  - name: otel
+    run: |
+      name="chaos-otel-$CHAOS_EXPERIMENT_RUN_ID"
+      trap 'docker rm -f "$name" >/dev/null 2>&1' EXIT
+      trap 'exit 0' TERM INT
+      docker run --rm --name "$name" \
+        -p "127.0.0.1:$OPENSHELL_E2E_OTLP_PORT:4317" \
+        otel/opentelemetry-collector:0.120.0 \
+        --config 'yaml:receivers::otlp::protocols::grpc::endpoint: 0.0.0.0:4317' \
+        --config 'yaml:exporters::debug::verbosity: detailed' \
+        --config 'yaml:service::pipelines::traces::receivers: [otlp]' \
+        --config 'yaml:service::pipelines::traces::exporters: [debug]' \
+        2>&1 &
+      wait $!
+
+# Events from watch lines that a flow can wait for with `wait: {signal: ...}`.
+signals:
+  # One reconcile sweep of the gateway: the store-to-backend reconcile loop
+  # sleeps 60s after each sweep ends, so the next one starts about 60s after
+  # this event.
+  - name: reconcile-sweep
+    watch: otel
+    match: 'Name\s+: reconcile\.sandboxes$'
+
+# These read only what `collect` wrote, so `chaos evaluate` works after the
+# e2e wrapper has cleaned up.
+checks:
+  - name: no-leaked-containers
+    description: >
+      When adapter collection runs (30s after the flow ends), docker ps -a
+      lists no container labelled with this run's sandbox namespace.
+    kind: shell
+    run: |
+      jq -e 'length == 0' "$CHAOS_EXPERIMENT_RUN_DIR/system/containers.json" > /dev/null \
+        || { jq -r '.[] | "\(.names) \(.state)"' "$CHAOS_EXPERIMENT_RUN_DIR/system/containers.json"; exit 1; }
+  - name: nothing-paused
+    description: >
+      When adapter collection runs (30s after the flow ends), no container
+      labelled with this run's sandbox namespace is paused.
+    kind: shell
+    run: |
+      jq -e 'map(select(.state == "paused")) | length == 0' \
+        "$CHAOS_EXPERIMENT_RUN_DIR/system/containers.json" > /dev/null \
+        || { jq -r '.[] | select(.state == "paused") | .names' "$CHAOS_EXPERIMENT_RUN_DIR/system/containers.json"; exit 1; }
+  - name: gateway-healthy
+    description: >
+      When adapter collection runs (30s after the flow ends), the gateway's
+      /healthz returned HTTP 200.
+    kind: shell
+    run: |
+      jq -e '.http_code == 200' "$CHAOS_EXPERIMENT_RUN_DIR/system/healthz.json" > /dev/null \
+        || { cat "$CHAOS_EXPERIMENT_RUN_DIR/system/healthz.json"; exit 1; }

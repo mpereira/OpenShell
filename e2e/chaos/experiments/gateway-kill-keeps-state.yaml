@@ -1,0 +1,146 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: gateway-kill-keeps-state
+version: 3
+title: Sandboxes survive a hard gateway kill
+hypothesis: >
+  After the gateway process gets SIGKILL, stays stopped for 15s and is started
+  again, each counter instance's script runs to completion without being
+  started again, and a sandbox created after every counter instance has ended
+  runs its script to exit code 0.
+description: >
+  Three counter instances run with restart-policy never. 20s after all three
+  have been observed running, gateway-down kills the gateway. After every
+  counter instance has ended, one fresh-sandbox instance is created, to show
+  that the restarted gateway can create new sandboxes and not only serve
+  existing ones. The checks encode desired behaviour.
+default-adapter: openshell-docker
+timeout: 15m
+expectations:
+  - issue: NVIDIA/OpenShell#4910
+    # The restarted gateway replaces each live supervisor, the sandbox runtime
+    # rejects the replacement, and the driver stops the sandbox container.
+    checks: [counter/exited-ok, counter/journal-complete]
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 3
+    timeout: 5m
+    env: {TICKS: "120", INTERVAL: "1"}
+    options: {restart-policy: never}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has the ticks 1 to $TICKS,
+          each once and in order, so no tick was skipped or repeated.
+        kind: shell
+        run: |
+          journal=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal
+          if ! diff=$(diff <(seq 1 "$TICKS") <(cut -d" " -f1 "$journal")); then
+            echo "$diff" | head -5
+            echo "want the ticks 1 to $TICKS, each once, in order"
+            exit 1
+          fi
+      - name: started-once
+        description: >
+          For each counter instance: .chaos/attempts has exactly 1 line, so
+          the script ran once and was not started again.
+        kind: shell
+        run: |
+          n=$(wc -l < "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/.chaos/attempts")
+          [ "$n" -eq 1 ] || { echo "want 1 attempt, got $n"; exit 1; }
+
+  - name: fresh-sandbox
+    description: >
+      One instance, created after every counter instance has ended. Its
+      script writes one file and exits 0.
+    kind: shell
+    instances: 1
+    timeout: 1m
+    run: echo ok > "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/hello"
+    checks:
+      - name: exited-ok
+        description: >
+          For the fresh-sandbox instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+
+operations:
+  - name: gateway-down
+    description: >
+      Sends SIGKILL to the gateway process and keeps it stopped for 15s. Then
+      runs the adapter's start hook, which waits up to 120s until the
+      gateway's /healthz returns 200, and records operation.reverted. The gateway
+      is unavailable for longer than 15s.
+    uses: outage
+    target: gateway
+    select: one
+    duration: 15s
+
+flow:
+  serial:
+    - parallel:
+        - counter
+        - serial: [{wait: {workload: counter, condition: started}}, {delay: 20s}, gateway-down]
+    - fresh-sandbox
+
+checks:
+  - name: gateway-recovered
+    description: >
+      The timeline has an operation.reverted event for gateway-down. The harness
+      records it only after the restarted gateway answered /healthz with 200.
+    kind: shell
+    env: {OPERATION: gateway-down}
+    run: |
+      # Slurp: jq 1.6 -e only looks at the last line of a stream.
+      jq -se --arg o "$OPERATION" 'any(.[]; .event == "operation.reverted" and .operation == $o)' \
+        "$CHAOS_EXPERIMENT_RUN_DIR/timeline.jsonl" > /dev/null \
+        || { echo "$OPERATION was never reverted"; exit 1; }
+  - name: database-healthy-after-restart
+    description: >
+      The gateway's database readiness probe passed in the last scrape of the
+      run, after the restart.
+    kind: metric
+    metric: openshell_server_readiness_database_healthy
+    value: last
+    equals: 1
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_readiness_database_healthy
+    description: >
+      1 while the gateway's database probe passes. The gateway restarts with
+      its database; a 0 after the restart would mean the gateway came back
+      before its state did.
+  - family: openshell_supervisor_policy_apply_results_total
+    description: >
+      Policy applies the supervisors reported, by outcome. A sandbox that
+      reconnects to the restarted gateway applies its policy again, so the
+      counter steps once per surviving sandbox.

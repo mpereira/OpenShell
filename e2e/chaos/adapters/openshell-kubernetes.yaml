@@ -1,0 +1,491 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell on the Kubernetes compute driver, run under e2e/with-kube-gateway.sh
+# and scripts/kubernetes-env.sh:
+#
+#   e2e/with-kube-gateway.sh e2e/chaos/scripts/kubernetes-env.sh \
+#     uv run --project e2e/chaos chaos run --adapter openshell-kubernetes <experiment>
+#
+# Every kubectl call names OPENSHELL_E2E_KUBE_CONTEXT, never the current
+# context. The gateway is the Helm release's StatefulSet or Deployment; the
+# run reaches it through port forwards that the setup hook and the gateway's
+# start hook (re)start, because a forward dies with the pod it points at.
+#
+# Experiments that need what this adapter lacks are reported as not
+# applicable: `unavailable` says why for the built-ins, and there is no
+# `reconcile-sweep` signal because the run has no OTLP collector. See
+# `chaos validate --all-adapters`.
+apiVersion: chaos/v1alpha1
+id: openshell-kubernetes
+backend: kubernetes
+kubernetes:
+  context: ${OPENSHELL_E2E_KUBE_CONTEXT}
+# What `openshell sandbox create` accepts: each `--env` value and each command
+# argument (crates/openshell-cli/src/main.rs). An experiment over a limit is
+# rejected by `chaos validate` and `chaos run` before anything starts.
+limits:
+  env-value-bytes: 8192
+  run-script-bytes: 28672
+unavailable:
+  restart-in-place: >-
+    the Kubernetes driver runs sandbox pods with restartPolicy: Never, so a
+    container is never restarted in place; this failure does not happen on
+    this adapter
+  freeze: >-
+    freezing a pod's processes needs node-level cgroup access through a
+    privileged pod, which this adapter does not have
+requires-env:
+  - OPENSHELL_BIN
+  - OPENSHELL_GATEWAY
+  - OPENSHELL_E2E_SANDBOX_NAMESPACE
+  - OPENSHELL_E2E_KUBE_CONTEXT
+  - OPENSHELL_E2E_KUBE_NAMESPACE
+  - OPENSHELL_E2E_KUBE_RELEASE
+  - OPENSHELL_E2E_HEALTH_PORT
+  # Set by scripts/kubernetes-env.sh.
+  - OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE
+  - OPENSHELL_E2E_GATEWAY_PORT
+  - OPENSHELL_E2E_METRICS_PORT
+  - OPENSHELL_E2E_KUBE_FORWARD_DIR
+
+preflight:
+  - name: kubernetes-reachable
+    description: The API server of OPENSHELL_E2E_KUBE_CONTEXT answers.
+    kind: shell
+    timeout: 30s
+    run: |
+      kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" version -o json \
+        | jq -r '"server " + .serverVersion.gitVersion'
+  - name: gateway-resource
+    description: The gateway StatefulSet or Deployment exists and has ready replicas.
+    kind: shell
+    timeout: 30s
+    run: |
+      ready=$(kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" -n "$OPENSHELL_E2E_KUBE_NAMESPACE" \
+        get "$OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE" -o jsonpath='{.status.readyReplicas}')
+      echo "$OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE ready replicas: ${ready:-0}"
+      [ "${ready:-0}" -ge 1 ]
+  - name: disk-space
+    description: The file system holding the run dir has at least 5 GiB free.
+    kind: shell
+    run: |
+      free_kb=$(df -Pk "$CHAOS_EXPERIMENT_RUN_DIR" | awk 'NR == 2 {print $4}')
+      echo "$((free_kb / 1024 / 1024)) GiB free"
+      [ "$free_kb" -ge $((5 * 1024 * 1024)) ]
+  - name: cli-runs
+    description: The OpenShell CLI under test runs.
+    kind: shell
+    run: '"$OPENSHELL_BIN" --version'
+  - name: jq-installed
+    description: jq, which the hooks and checks use, is installed.
+    kind: shell
+    run: command -v jq
+  - name: lsof-installed
+    description: lsof, which the hooks use to replace port forwards, is installed.
+    kind: shell
+    run: command -v lsof
+  - name: gateway-up
+    description: The gateway's /healthz returns HTTP 200 through the wrapper's forward.
+    kind: shell
+    run: |
+      code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$OPENSHELL_E2E_HEALTH_PORT/healthz" || true)
+      echo "HTTP $code"
+      [ "$code" = 200 ]
+
+# Runs after preflight and prints one JSON object about the system under test,
+# recorded verbatim in manifest.json as `environment.system`: the CLI under
+# test, the Kubernetes server, and the gateway's image.
+describe: |
+  jq -n \
+    --arg openshell "$("$OPENSHELL_BIN" --version 2>/dev/null | head -1)" \
+    --arg kubernetes "$(kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" version -o json 2>/dev/null \
+      | jq -r '.serverVersion.gitVersion')" \
+    --arg gateway_image "$(kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" -n "$OPENSHELL_E2E_KUBE_NAMESPACE" \
+      get "$OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)" \
+    '{openshell: $openshell, kubernetes: $kubernetes, gateway_image: $gateway_image}'
+
+prelude: |
+  # shellcheck shell=bash
+  set -euo pipefail
+
+  os() {
+    "$OPENSHELL_BIN" "$@"
+  }
+
+  kctl() {
+    kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" "$@"
+  }
+
+  # Sandbox names are capped at 19 characters and must be DNS-1123 labels, so the
+  # instance name is not usable directly. This is deterministic per run and
+  # instance: c<run-id suffix>-<cksum of the instance name>.
+  sandbox_name() {
+    local sum
+    sum=$(printf '%s' "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME" | cksum | cut -d' ' -f1)
+    printf 'c%s-%s\n' "${CHAOS_EXPERIMENT_RUN_ID##*-}" "$sum"
+  }
+
+  # Prints the name of the instance's pod with the given boundary role
+  # (workload or supervisor). The driver labels both with the lowercased
+  # sandbox id.
+  role_pod() {
+    local pair
+    pair=$(printf '%s' "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID" | tr '[:upper:]' '[:lower:]')
+    kctl -n "$OPENSHELL_E2E_SANDBOX_NAMESPACE" get pods -o name \
+      -l "openshell.ai/boundary-pair=$pair,openshell.ai/boundary-role=$1" | head -n1
+  }
+
+  # Frees a local port for a new forward. The only process it stops is the
+  # port-forward this adapter started, whose pid the start hook wrote to
+  # gateway.pid; a port anything else holds is an error, never a kill.
+  free_port() {
+    local port=$1 own=${2:-} pid comm
+    for pid in $(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2> /dev/null || true); do
+      if [ -n "$own" ] && [ "$pid" = "$own" ]; then
+        kill "$pid" 2> /dev/null || true
+        continue
+      fi
+      comm=$(ps -p "$pid" -o comm= 2> /dev/null || true)
+      echo "port $port is held by $comm (pid $pid), not this run's port-forward" >&2
+      return 1
+    done
+    for _ in $(seq 50); do
+      lsof -nP -t -iTCP:"$port" -sTCP:LISTEN > /dev/null 2>&1 || return 0
+      sleep 0.1
+    done
+    echo "port $port still in use" >&2
+    return 1
+  }
+
+  # (Re)starts one kubectl port-forward to the gateway resource for the gRPC,
+  # health and metrics ports, on the local ports the run already uses, and
+  # waits until all three accept connections. A forward pins one pod and exits
+  # when that pod goes away, so the gateway's start hook calls this after
+  # every fault.
+  forward_gateway() {
+    local dir=$OPENSHELL_E2E_KUBE_FORWARD_DIR port own=
+    if [ -f "$dir/gateway.pid" ]; then
+      own=$(cat "$dir/gateway.pid")
+      kill "$own" 2> /dev/null || true
+    fi
+    for port in "$OPENSHELL_E2E_GATEWAY_PORT" "$OPENSHELL_E2E_HEALTH_PORT" "$OPENSHELL_E2E_METRICS_PORT"; do
+      free_port "$port" "$own"
+    done
+    nohup kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" -n "$OPENSHELL_E2E_KUBE_NAMESPACE" \
+      port-forward "$OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE" \
+      "$OPENSHELL_E2E_GATEWAY_PORT:grpc" \
+      "$OPENSHELL_E2E_HEALTH_PORT:health" \
+      "$OPENSHELL_E2E_METRICS_PORT:metrics" \
+      < /dev/null >> "$dir/gateway.log" 2>&1 &
+    echo $! > "$dir/gateway.pid"
+    for _ in $(seq 30); do
+      if curl -sf --max-time 2 "http://127.0.0.1:$OPENSHELL_E2E_HEALTH_PORT/healthz" > /dev/null; then
+        return 0
+      fi
+      if ! kill -0 "$(cat "$dir/gateway.pid")" 2> /dev/null; then
+        echo "port-forward exited; see $dir/gateway.log" >&2
+        tail -n 5 "$dir/gateway.log" >&2
+        return 1
+      fi
+      sleep 1
+    done
+    echo "gateway /healthz not reachable through the forward after 30s" >&2
+    return 1
+  }
+
+# Replaces the wrapper's two forwards with one the run controls, and adds
+# the metrics port.
+setup: |
+  forward_gateway
+
+options:
+  # Empty means the gateway's default sandbox image and policy. `policy`
+  # names an entry of the experiment's `data`.
+  image: {default: ""}
+  policy: {default: "", data: true}
+  restart-policy: {default: never, enum: [never, on-failure, always]}
+
+instance:
+  # Under the sandbox user's home. Whether it survives the workload pod being
+  # replaced depends on the volume the driver mounts there.
+  output-dir: /sandbox/chaos-output
+  create: |
+    # Creates the instance's sandbox detached and prints the sandbox id.
+
+    args=(sandbox create --name "$(sandbox_name)" --detach
+      --restart-policy "$CHAOS_EXPERIMENT_WORKLOAD_OPTION_RESTART_POLICY")
+    if [ -n "${CHAOS_EXPERIMENT_WORKLOAD_OPTION_IMAGE:-}" ]; then
+      args+=(--from "$CHAOS_EXPERIMENT_WORKLOAD_OPTION_IMAGE")
+    fi
+    if [ -n "${CHAOS_EXPERIMENT_WORKLOAD_OPTION_POLICY:-}" ]; then
+      args+=(--policy "$CHAOS_EXPERIMENT_WORKLOAD_OPTION_POLICY")
+    fi
+    while IFS= read -r line; do
+      [ -n "$line" ] && args+=(--env "$line")
+    done < "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_ENV_FILE"
+
+    wrapper=$(cat "$CHAOS_EXPERIMENT_WORKLOAD_WRAPPER_FILE")
+    script=$(cat "$CHAOS_EXPERIMENT_WORKLOAD_RUN_FILE")
+    os "${args[@]}" -- sh -c "$wrapper" chaos "$script" >&2
+    os sandbox get "$(sandbox_name)" -o json | jq -er .id
+  status: |
+    # Prints Pending|Running|Succeeded|Failed|Unknown for the instance's sandbox,
+    # then the gateway's Ready condition reason when it has one, with the same
+    # phase mapping as openshell-docker: it reads the gateway's view, which is
+    # the same on every compute driver.
+
+    os sandbox get "$(sandbox_name)" -o json | jq -r '
+      def ready_false(reason):
+        any(.conditions[]?; .type == "Ready"
+          and (.status | ascii_downcase) == "false" and .reason == reason);
+      (.phase // "") as $p | .exit_code as $code
+      | (if $p == "Ready" then "Running"
+        elif $code != null and ($p == "Completed" or $p == "Stopped"
+          or ($p == "Error" and ready_false("MainProcessFailed"))) then
+          (if $code == 0 then "Succeeded" else "Failed" end)
+        elif $p == "Completed" then "Succeeded"
+        elif $p == "Error" and $code == null and ready_false("ContainerExited") then "Unknown"
+        elif $p == "Error" then "Failed"
+        elif $p == "Provisioning" or $p == "Starting" or $p == "Unspecified" then "Pending"
+        else "Unknown" end) as $state
+      | [$state, (first(.conditions[]? | select(.type == "Ready") | .reason) // empty)]
+      | join(" ")'
+  collect: |
+    # Copies the instance output dir and pod logs into the instance dir. Download
+    # goes through the gateway; if that fails, kubectl cp reads the workload pod
+    # directly, which needs tar in its image.
+
+    dir=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_DIR
+    ns=$OPENSHELL_E2E_SANDBOX_NAMESPACE
+    mkdir -p "$dir/output" "$dir/logs"
+
+    if ! os sandbox download "$(sandbox_name)" "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR" "$dir/output"; then
+      pod=$(role_pod workload)
+      if [ -z "$pod" ]; then
+        echo "no workload pod for $CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID" >&2
+        exit 1
+      fi
+      kctl -n "$ns" cp "${pod#pod/}:$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/." "$dir/output"
+    fi
+
+    for role in workload supervisor; do
+      pod=$(role_pod "$role")
+      if [ -n "$pod" ]; then
+        kctl -n "$ns" logs --timestamps --all-containers "$pod" > "$dir/logs/$role.log" 2>&1 || true
+      fi
+    done
+  delete: |
+    # Deletes the instance's sandbox. A sandbox that is already gone counts as deleted.
+
+    name=$(sandbox_name)
+    if out=$(os sandbox delete "$name" 2>&1); then
+      exit 0
+    fi
+    if ! os sandbox get "$name" -o json > /dev/null 2>&1 \
+      && grep -qi 'not found' <<< "$out"; then
+      exit 0
+    fi
+    echo "$out" >&2
+    exit 1
+
+targets:
+  gateway:
+    # restart deletes the gateway pod with the operation's grace
+    # period; outage scales the resource to 0 and back.
+    type: workload
+    namespace: ${OPENSHELL_E2E_KUBE_NAMESPACE}
+    resource: ${OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE}
+    start: |
+      # Waits until the controller has replaced the gateway pod and it is ready,
+      # then restarts the port forwards, which died with the old pod.
+
+      kctl -n "$OPENSHELL_E2E_KUBE_NAMESPACE" rollout status \
+        "$OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE" --timeout=240s >&2
+      forward_gateway
+  roles:
+    # Faults on a pod target delete the pod. Both pods have restartPolicy
+    # Never, so the driver, not the kubelet, decides what happens next.
+    sandbox:
+      type: pod
+      namespace: ${OPENSHELL_E2E_SANDBOX_NAMESPACE}
+      labels:
+        openshell.ai/boundary-pair: ${CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID}
+        openshell.ai/boundary-role: workload
+    supervisor:
+      type: pod
+      namespace: ${OPENSHELL_E2E_SANDBOX_NAMESPACE}
+      labels:
+        openshell.ai/boundary-pair: ${CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_SYSTEM_ID}
+        openshell.ai/boundary-role: supervisor
+
+# The same as openshell-docker: both go through the CLI only.
+operations:
+  openshell-policy-set:
+    options:
+      # Names an entry of the experiment's `data`: an OpenShell policy.
+      policy: {data: true, required: true}
+    run: |
+      # Applies a policy and returns once the sandboxes report it loaded.
+      #
+      # instances scope: `policy set --wait` on the instance's sandbox.
+      # global scope: `policy set --global`, which has no --wait. For each running
+      # instance, wait until the gateway reports the global policy as the sandbox's
+      # source, then until the sandbox logs a reload with that policy's hash.
+
+      #
+      # Before the change it saves the policy in effect to the state dir for
+      # `revert`: the sandbox's active policy, or the stored global policy when
+      # there is one.
+
+      policy=$CHAOS_EXPERIMENT_OPERATION_OPTION_POLICY
+      state=$CHAOS_EXPERIMENT_OPERATION_STATE_DIR
+
+      if [ "$CHAOS_EXPERIMENT_OPERATION_SCOPE" = instances ]; then
+        os sandbox get "$(sandbox_name)" --policy-only > "$state/policy.yaml"
+        os policy set "$(sandbox_name)" --policy "$policy" --wait --timeout 60
+        echo ok > "$CHAOS_EXPERIMENT_OPERATION_OUTCOME_FILE"
+        exit 0
+      fi
+
+      # Prints nothing when no global policy was ever set.
+      os policy get --global --base -o json > "$state/before.json"
+      if jq -e '.policy != null' "$state/before.json" > /dev/null 2>&1; then
+        jq '.policy' "$state/before.json" > "$state/policy.json"
+      fi
+      os policy set --global --yes --policy "$policy"
+
+      deadline=$((SECONDS + 120))
+      # fd 3, so a command in the loop that reads stdin cannot consume the list.
+      while IFS= read -r -u 3 instance; do
+        [ -n "$instance" ] || continue
+        sandbox=$(CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME=$instance sandbox_name)
+        hash=
+        until [ -n "$hash" ]; do
+          hash=$(os settings get "$sandbox" --json 2> /dev/null \
+            | jq -r 'select(.policy_source == "global") | .policy_hash // empty' || true)
+          [ -n "$hash" ] && break
+          [ "$SECONDS" -lt "$deadline" ] || { echo "$instance: policy source never became global" >&2; exit 1; }
+          sleep 1
+        done
+        # Read the logs first: under pipefail, grep -q closing the pipe early would
+        # fail the pipeline even on a match.
+        until logs=$(os logs "$sandbox" --source sandbox -n 500 2> /dev/null) \
+          && grep -qF "Policy reloaded successfully (global) [policy_hash:$hash" <<< "$logs"; do
+          [ "$SECONDS" -lt "$deadline" ] || { echo "$instance: no global reload with hash $hash" >&2; exit 1; }
+          sleep 1
+        done
+        echo "$instance $sandbox $hash"
+      done 3< "$CHAOS_EXPERIMENT_OPERATION_INSTANCES_FILE"
+      echo ok > "$CHAOS_EXPERIMENT_OPERATION_OUTCOME_FILE"
+    revert: |
+      # Puts back the policy `run` saved. instances scope: sets the sandbox's
+      # previous active policy on it (as a sandbox policy, even when it came
+      # from the global one) and waits for the sandbox to load it. global scope:
+      # sets the previous global policy back, or deletes the global policy when
+      # there was none; it does not wait for the sandboxes to reload.
+
+      state=$CHAOS_EXPERIMENT_OPERATION_STATE_DIR
+
+      if [ "$CHAOS_EXPERIMENT_OPERATION_SCOPE" = instances ]; then
+        os policy set "$(sandbox_name)" --policy "$state/policy.yaml" --wait --timeout 60
+        exit 0
+      fi
+
+      if [ -f "$state/policy.json" ]; then
+        os policy set --global --yes --policy "$state/policy.json"
+      else
+        os policy delete --global --yes
+      fi
+  openshell-sandbox-restart:
+    options:
+      # Whole seconds. Before stopping, the hook sleeps a random time from 0 to
+      # this, drawn independently for each instance. Not seeded by --seed.
+      jitter: {default: "0"}
+    revert: none
+    reason: A stop and a start leave the sandbox as it was; there is nothing to put back.
+    run: |
+      # Stops the instance's sandbox, then starts it again. Writes the outcome to
+      # the outcome file and the operation log, as openshell-docker does:
+      #
+      #   ok                       stop and start succeeded; the sandbox is Ready
+      #   skipped <phase>          the sandbox was not Ready, so it was left alone
+      #   failed stop-failed ...   sandbox stop failed, with its output
+      #   failed start-failed ...  sandbox stop succeeded, sandbox start failed
+
+      outcome() {
+        printf '%s\n' "$*" > "$CHAOS_EXPERIMENT_OPERATION_OUTCOME_FILE"
+        printf '%s\n' "$*"
+      }
+
+      [ "$CHAOS_EXPERIMENT_OPERATION_SCOPE" = instances ] \
+        || { echo "openshell-sandbox-restart takes a target, not scope global" >&2; exit 1; }
+      jitter=$CHAOS_EXPERIMENT_OPERATION_OPTION_JITTER
+      if ! [[ "$jitter" =~ ^[0-9]+$ ]] || [ "$jitter" -gt 30 ]; then
+        echo "jitter must be whole seconds from 0 to 30, not '$jitter'" >&2
+        exit 1
+      fi
+      if [ "$jitter" -gt 0 ]; then
+        ms=$((RANDOM % (jitter * 1000 + 1)))
+        sleep "$((ms / 1000)).$(printf %03d $((ms % 1000)))"
+      fi
+      sandbox=$(sandbox_name)
+      phase=$(os sandbox get "$sandbox" -o json | jq -r '.phase // ""') || phase=unreadable
+      [ "$phase" = Ready ] || { outcome skipped "$phase"; exit 0; }
+      out=$(os sandbox stop "$sandbox" 2>&1) || { outcome failed "stop-failed $(tr '\n' ' ' <<< "$out")"; exit 0; }
+      out=$(os sandbox start "$sandbox" 2>&1) || { outcome failed "start-failed $(tr '\n' ' ' <<< "$out")"; exit 0; }
+      outcome ok
+
+collect: |
+  # Copies what the adapter checks read into the run dir. Must run before the e2e
+  # wrapper uninstalls the release.
+
+  run=$CHAOS_EXPERIMENT_RUN_DIR
+  kctl -n "$OPENSHELL_E2E_KUBE_NAMESPACE" logs --timestamps --all-containers \
+    "$OPENSHELL_E2E_KUBE_GATEWAY_RESOURCE" > "$run/logs/gateway.log" 2>&1 || true
+  cp "$OPENSHELL_E2E_KUBE_FORWARD_DIR/gateway.log" "$run/logs/port-forward.log" 2> /dev/null || true
+
+  # Give the gateway time to finish deleting pods before looking for leaks.
+  sleep 30
+
+  # Every pod the driver made for a sandbox carries a boundary role.
+  kctl -n "$OPENSHELL_E2E_SANDBOX_NAMESPACE" get pods -l openshell.ai/boundary-role -o json \
+    | jq '.items | map({name: .metadata.name, phase: .status.phase,
+        deleting: (.metadata.deletionTimestamp != null), labels: .metadata.labels})' \
+    > "$run/system/pods.json"
+
+  code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$OPENSHELL_E2E_HEALTH_PORT/healthz" || true)
+  jq -n --arg code "$code" '{http_code: ($code | tonumber? // 0)}' > "$run/system/healthz.json"
+
+# Recorded from the start of the flow until adapter collection ends. Scrapes
+# fail while the gateway pod is being replaced and its forward restarted.
+metrics:
+  - name: gateway
+    url: http://127.0.0.1:${OPENSHELL_E2E_METRICS_PORT}/metrics
+    interval: 2s
+watch:
+  - name: kube-events
+    run: >-
+      exec kubectl --context "$OPENSHELL_E2E_KUBE_CONTEXT" -n "$OPENSHELL_E2E_SANDBOX_NAMESPACE"
+      get events --watch-only
+      -o jsonpath='{.lastTimestamp} {.type} {.involvedObject.kind}/{.involvedObject.name} {.reason}: {.message}{"\n"}'
+
+checks:
+  - name: no-leaked-pods
+    description: >
+      When adapter collection runs (30s after the flow ends), no pod with an
+      openshell.ai/boundary-role label is left in the sandbox namespace.
+    kind: shell
+    run: |
+      jq -e 'length == 0' "$CHAOS_EXPERIMENT_RUN_DIR/system/pods.json" > /dev/null \
+        || { jq -r '.[] | "\(.name) \(.phase) deleting=\(.deleting)"' "$CHAOS_EXPERIMENT_RUN_DIR/system/pods.json"; exit 1; }
+  - name: gateway-healthy
+    description: >
+      When adapter collection runs (30s after the flow ends), the gateway's
+      /healthz returned HTTP 200.
+    kind: shell
+    run: |
+      jq -e '.http_code == 200' "$CHAOS_EXPERIMENT_RUN_DIR/system/healthz.json" > /dev/null \
+        || { cat "$CHAOS_EXPERIMENT_RUN_DIR/system/healthz.json"; exit 1; }

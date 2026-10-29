@@ -386,6 +386,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
+| `e2e/chaos/`    | [Chaos experiments](e2e/chaos/README.md) against e2e gateways |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |

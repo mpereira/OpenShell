@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: gateway-graceful-restart
+version: 2
+title: Counter instances resume after a graceful gateway restart
+hypothesis: >
+  When the gateway process gets SIGTERM and is started again, its
+  graceful-stop sweep stops the sandbox of every counter instance, the
+  restarted gateway starts each sandbox again, and each instance's script
+  resumes from its saved tick with no tick missing from its journal.
+description: >
+  Two counter instances run. 15s after both have been observed running,
+  gateway-restart stops and restarts the gateway. The checks encode current
+  behaviour, observed on 2026-10-27: each instance's script is started a
+  second time (the wrapper records two attempts), and the instance output
+  directory keeps its files across the restart.
+default-adapter: openshell-docker
+timeout: 15m
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 2
+    timeout: 6m
+    env: {TICKS: "90", INTERVAL: "1"}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has every tick from 1 to
+          $TICKS. A tick may appear twice, because a script that is started
+          again can repeat the tick the previous attempt was stopped on. A
+          missing tick fails.
+        kind: shell
+        run: |
+          journal=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal
+          if ! missing=$(diff <(seq 1 "$TICKS") <(cut -d" " -f1 "$journal" | sort -un)); then
+            echo "$missing" | head -5
+            echo "want each tick from 1 to $TICKS at least once"
+            exit 1
+          fi
+      - name: restarted
+        description: >
+          For each counter instance: .chaos/attempts has at least 2 lines, so
+          the script was started again after the gateway restart.
+        kind: shell
+        run: |
+          n=$(wc -l < "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/.chaos/attempts")
+          [ "$n" -ge 2 ] || { echo "want >= 2 attempts, got $n"; exit 1; }
+
+operations:
+  - name: gateway-restart
+    description: >
+      Sends SIGTERM to the gateway process and, if it has not exited after
+      60s, SIGKILL. Then runs the adapter's start hook, which waits until the
+      gateway's /healthz returns 200, and records target.restarted.
+    uses: restart
+    target: gateway
+    select: one
+    grace-period: 60s
+
+flow:
+  parallel:
+    - counter
+    - serial: [{wait: {workload: counter, condition: started}}, {delay: 15s}, gateway-restart]
+
+checks:
+  - name: all-supervisors-connected
+    description: >
+      At some scrape all 2 counter instances had their supervisor session
+      registered on the gateway, so the metric saw the full workload.
+    kind: metric
+    metric: openshell_server_supervisor_sessions
+    value: max
+    at-least: 2
+  - name: database-healthy-after-restart
+    description: >
+      The gateway's database readiness probe passed in the last scrape of the
+      run, after the restart.
+    kind: metric
+    metric: openshell_server_readiness_database_healthy
+    value: last
+    equals: 1
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_readiness_database_healthy
+    description: >
+      1 while the gateway's database probe passes. The gateway restarts with
+      its database; a 0 after the restart would mean the gateway came back
+      before its state did.
+  - family: openshell_supervisor_policy_apply_results_total
+    description: >
+      Policy applies the supervisors reported, by outcome. A sandbox that
+      reconnects to the restarted gateway applies its policy again, so the
+      counter steps once per surviving sandbox.

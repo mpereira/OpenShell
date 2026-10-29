@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: 1
+providers:
+  - name: chaos
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+  - name: chaos-experiments
+    type: file
+    folder: Experiments
+    options:
+      path: /var/lib/grafana/import/dashboards

@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: supervisor-kill
+version: 2
+title: A sandbox survives its supervisor being killed
+hypothesis: >
+  When the supervisor of a running sandbox is killed without warning, the
+  counter script in that sandbox either keeps running or is started again
+  under restart-policy on-failure, and the instance's journal still has every
+  tick from 1 to $TICKS.
+description: >
+  Three counter instances run with restart-policy on-failure. 10s after all
+  three have been observed running, kill-supervisors kills the supervisors
+  of two of them. The two are picked by a random generator seeded
+  with --seed and the fault name, so a rerun with the same seed and the same
+  instance count picks the same two. The third instance gets no fault: if it
+  passes and the other two fail, the fault caused the failure. The checks
+  encode desired behaviour. Current, documented behaviour differs: the
+  gateway treats a supervisor exit as an infrastructure failure, marks the
+  sandbox Error and stops it, and restart-policy applies only when the
+  workload process exits.
+default-adapter: openshell-docker
+timeout: 15m
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 3
+    timeout: 5m
+    env: {TICKS: "60", INTERVAL: "1"}
+    options: {restart-policy: on-failure}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has every tick from 1 to
+          $TICKS. A tick may appear twice, because a script that is started
+          again can repeat the tick the previous attempt was stopped on. A
+          missing tick fails.
+        kind: shell
+        run: |
+          journal=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal
+          if ! missing=$(diff <(seq 1 "$TICKS") <(cut -d" " -f1 "$journal" | sort -un)); then
+            echo "$missing" | head -5
+            echo "want each tick from 1 to $TICKS at least once"
+            exit 1
+          fi
+
+operations:
+  - name: kill-supervisors
+    description: >
+      Kills the supervisors of two counter instances without a grace
+      period, picked as the experiment description says. The harness does not
+      restart them.
+    uses: kill
+    target: {workload: counter, role: supervisor}
+    select: {count: 2}
+
+flow:
+  parallel:
+    - counter
+    - serial: [{wait: {workload: counter, condition: started}}, {delay: 10s}, kill-supervisors]
+
+checks:
+  - name: all-supervisors-connected
+    description: >
+      At some scrape all 3 counter instances had their supervisor session
+      registered on the gateway, so the metric saw the full workload.
+    kind: metric
+    metric: openshell_server_supervisor_sessions
+    value: max
+    at-least: 3
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_relay_pending
+    description: >
+      Relay channels waiting for a supervisor to connect back. A killed or
+      paused supervisor leaves its channel pending until it returns or the
+      channel expires.
+  - family: openshell_server_routed_request_attempts_total
+    description: >
+      Relay setup and outbound peer attempts, each retry counted. Requests to
+      a sandbox whose supervisor is gone retry here before they fail.
+  - family: openshell_server_relay_expired_total
+    description: >
+      Pending relay channels dropped because the supervisor did not connect
+      back in time.

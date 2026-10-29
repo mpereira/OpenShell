@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: smoke
+version: 1
+title: Counters run to completion with no faults
+hypothesis: >
+  With no faults, each of two counter instances created through the adapter
+  hooks runs its script to exit code 0, its output directory is copied into
+  the run directory, and the adapter checks find no container left in the e2e
+  sandbox namespace.
+description: >
+  A baseline for the harness and the adapter. With no faults, a FAIL or ERROR
+  points at the harness, the adapter hooks or the environment, not at
+  OpenShell's fault handling. The checks encode desired behaviour.
+default-adapter: openshell-docker
+timeout: 10m
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 2
+    timeout: 3m
+    env: {TICKS: "5", INTERVAL: "1"}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has exactly $TICKS lines, so
+          no tick was skipped or repeated.
+        kind: shell
+        run: |
+          n=$(wc -l < "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal")
+          [ "$n" -eq "$TICKS" ] || { echo "want $TICKS ticks, got $n"; exit 1; }
+
+flow: counter
+
+checks:
+  - name: all-supervisors-connected
+    description: >
+      At some scrape all 2 counter instances had their supervisor session
+      registered on the gateway, so the metric saw the full workload.
+    kind: metric
+    metric: openshell_server_supervisor_sessions
+    value: max
+    at-least: 2
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_grpc_requests_total
+    description: >
+      gRPC requests the gateway handled, by method and status. The harness's
+      own calls (create, status, delete) are in it, so the rate shows the load
+      the experiment puts on the gateway.

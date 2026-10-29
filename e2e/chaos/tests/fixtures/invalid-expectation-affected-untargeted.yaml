@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: invalid-expectation-affected-untargeted
+version: 1
+title: t
+hypothesis: h
+description: d
+default-adapter: openshell-docker
+expectations:
+  - {issue: NVIDIA/OpenShell#1, checks: [w/ok], instances: affected}
+workloads:
+  - name: w
+    description: d
+    kind: shell
+    instances: 2
+    timeout: 1m
+    run: "true"
+    checks: [{name: ok, description: d, kind: exit-code, equals: 0}]
+flow: w

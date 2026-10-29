@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: invalid-operation-name-clash
+version: 1
+title: t
+hypothesis: h
+description: d
+default-adapter: openshell-docker
+data:
+  p: {version: 1}
+workloads:
+  - name: w
+    description: d
+    kind: shell
+    instances: 2
+    timeout: 1m
+    options: {policy: p}
+    run: "true"
+    checks: [{name: ok, description: d, kind: exit-code, equals: 0}]
+operations:
+  - {name: w, description: d, uses: openshell-policy-set, options: {policy: p}, scope: global}
+flow: {serial: [w]}
