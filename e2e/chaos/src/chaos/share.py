@@ -18,6 +18,7 @@ import math
 import re
 import shutil
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -208,7 +209,13 @@ def _bucket(points: list[list[float | None]]) -> list[list[float | None]]:
 
 
 def _num(v: float) -> str:
-    return f"{float(f'{v:.4g}'):g}"
+    """`v` to four significant digits in plain decimal. Mermaid's xychart
+    parser rejects exponent form (`9e-05`, `1.235e+06`), which `g` and
+    `repr` print for small and large values."""
+    v = float(v)
+    if v == 0:
+        return "0"
+    return format(Decimal(f"{v:.4g}"), "f")
 
 
 def xychart(chart: dict[str, Any]) -> tuple[str, str]:

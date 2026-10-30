@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -305,3 +306,26 @@ def test_xychart_buckets_long_series_and_drops_leading_gaps():
         "",
         "no scrapes with a value",
     )
+
+
+def test_mermaid_numbers_are_plain_decimals(tmp_path):
+    """Mermaid's xychart parser rejects exponent form, which Python prints
+    for small per-tick latencies (`9e-05`) and for large values."""
+    run = share_run(tmp_path)
+    jsonl(
+        run / "system" / "metrics" / "gateway.jsonl",
+        [
+            {"t": float(t), "up": 1, "samples": {"sessions": v}}
+            for t, v in enumerate([0.000235, 0, 0.00009, 0.0001855, 0, 123456.7])
+        ],
+    )
+    out = tmp_path / "page.md"
+    assert main(["share", str(run), "-o", str(out)]) == 0
+    text = out.read_text()
+    fences = [block.split("```")[0] for block in text.split("```mermaid\n")[1:]]
+    assert any("xychart-beta" in fence for fence in fences)
+    for fence in fences:
+        assert not re.search(r"\d[eE][+-]?\d", fence), fence
+    sessions = text.split("#### sessions\n")[1].split("####")[0]
+    assert "  line [0.000235, 0, 0.00009, 0.0001855, 0, 123500]\n" in sessions
+    assert '" 0 --> 135800\n  line [' in sessions
