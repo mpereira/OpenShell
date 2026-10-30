@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: sandbox-stop-start
+version: 2
+title: A stopped sandbox starts again every time
+hypothesis: >
+  Every openshell sandbox start of a sandbox that openshell sandbox stop
+  stopped returns with the sandbox Ready, however often the sandboxes are
+  restarted, and the counter script in each one still finishes with every
+  tick from 1 to $TICKS.
+description: >
+  Eight counter instances run with restart-policy on-failure. Restart runs
+  sandbox stop and then sandbox start on every instance's sandbox, in
+  parallel, aimed at the gateway's reconcile sweep, again and again for 20m.
+  The sweep runs 60s after the previous one ended, and the gateway exports
+  each sweep's reconcile.sandboxes span when it ends, so the flow waits for
+  that span and restarts 57.5s later. A wait returns only for a sweep newer
+  than the one it last returned for, so each round lands on the next sweep
+  and never re-fires on the one it already waited for. Each instance then
+  waits a random 0 to
+  4s, so its start lands from about 2s before to 2s after the next sweep. A
+  sweep that lands in the window between a start committing Starting and the
+  driver starting the sandbox sees the old, exited one. That window is a
+  few hundred milliseconds with the Docker driver, so each instance has a
+  chance of a few percent at each sweep, and 8 instances over about 20
+  sweeps make it likely to happen several times.
+default-adapter: openshell-docker
+timeout: 55m
+
+expectations:
+  - issue: NVIDIA/OpenShell#4981
+    # The sweep writes Error (ContainerExited) during a start, and sandbox
+    # start fails even though the new supervisor connects. NVIDIA/OpenShell#4932
+    # reports the same race from the stop side. The fix in review is
+    # NVIDIA/OpenShell#4983, which defers reconciliation during lifecycle
+    # operations.
+    checks: [counter/starts-ready]
+    # The race triggers in about 1 of 72 starts, so a run can miss it.
+    kind: flaky
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 8
+    timeout: 40m
+    env: {TICKS: "1500", INTERVAL: "1"}
+    options: {restart-policy: on-failure}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has every tick from 1 to
+          $TICKS. A tick may appear twice, because a script that is started
+          again can repeat the tick the previous attempt was stopped on. A
+          missing tick fails.
+        kind: shell
+        run: |
+          journal=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal
+          if ! missing=$(diff <(seq 1 "$TICKS") <(cut -d" " -f1 "$journal" | sort -un)); then
+            echo "$missing" | head -5
+            echo "want each tick from 1 to $TICKS at least once"
+            exit 1
+          fi
+      - name: restarted
+        description: >
+          For each counter instance: restart stopped and started its sandbox
+          at least once, so the other checks are about a restarted sandbox.
+        kind: shell
+        run: |
+          log=$CHAOS_EXPERIMENT_RUN_DIR/logs/operations/restart.$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME.log
+          n=$(grep -cx ok "$log" || true)
+          [ "${n:-0}" -ge 1 ] || { echo "no run of restart restarted the sandbox"; exit 1; }
+          echo "$n restarts"
+      - name: starts-ready
+        description: >
+          For each counter instance: no run of restart had outcome failed,
+          so every stop and start returned with the phase it asked for. Runs that skipped a sandbox that was not Ready are not
+          failures here.
+        kind: shell
+        run: |
+          log=$CHAOS_EXPERIMENT_RUN_DIR/logs/operations/restart.$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME.log
+          [ -f "$log" ] || exit 0
+          if grep '^failed' "$log"; then exit 1; fi
+          echo "$(grep -c '^skipped' "$log" || true) runs skipped"
+
+operations:
+  - name: restart
+    description: >
+      Stops and starts the sandbox of every counter instance, in parallel,
+      each after a random wait of 0 to 4s.
+    uses: openshell-sandbox-restart
+    target: {workload: counter}
+    select: all
+    options: {jitter: "4"}
+
+flow:
+  parallel:
+    - counter
+    - serial:
+        - wait: {workload: counter, condition: started}
+        - repeat:
+            for: 20m
+            serial:
+              - wait: {signal: reconcile-sweep, delay: 57500ms, timeout: 3m}
+              - restart
+
+checks:
+  - name: all-supervisors-connected
+    description: >
+      At some scrape all 8 counter instances had their supervisor session
+      registered on the gateway, so the metric saw the full workload.
+    kind: metric
+    metric: openshell_server_supervisor_sessions
+    value: max
+    at-least: 8
+  - name: no-lock-timeouts
+    description: >
+      The gateway's mutation lock timeout counter did not increase during the
+      run: the parallel stop and start calls never waited past the lock
+      timeout.
+    kind: metric
+    metric: openshell_server_mutation_lock_timeouts_total
+    value: increase
+    at-most: 0
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_mutation_lock_timeouts_total
+    description: >
+      Mutation lock acquisitions that timed out. Parallel stop and start calls
+      on many sandboxes contend for the per-sandbox locks; a timeout here
+      would make a call fail for a reason the experiment did not inject.
+  - family: openshell_server_mutation_lock_wait_seconds
+    description: >
+      Time spent acquiring a mutation lock. Shows how much the parallel
+      restarts queue behind each other inside the gateway.
+  - family: openshell_server_grpc_requests_total
+    description: >
+      gRPC requests the gateway handled, by method and status. The harness's
+      own calls (create, status, delete) are in it, so the rate shows the load
+      the experiment puts on the gateway.

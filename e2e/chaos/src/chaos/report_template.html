@@ -1,0 +1,523 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Template for `chaos report`; report.py fills in the title and the data block. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ef;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #7a7975;
+  --grid: #e4e3df;
+  --series-1: #2a78d6;
+  --neutral: #b9b8b2;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+  --band: rgba(11, 11, 11, 0.07);
+  --band-strong: rgba(11, 11, 11, 0.16);
+  --down: rgba(208, 59, 59, 0.13);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e88;
+    --grid: #383835;
+    --series-1: #3987e5;
+    --neutral: #5b5a56;
+    --band: rgba(240, 239, 236, 0.08);
+    --band-strong: rgba(240, 239, 236, 0.18);
+    --down: rgba(208, 59, 59, 0.22);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #1a1a19;
+  --surface-2: #232321;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #8f8e88;
+  --grid: #383835;
+  --series-1: #3987e5;
+  --neutral: #5b5a56;
+  --band: rgba(240, 239, 236, 0.08);
+  --band-strong: rgba(240, 239, 236, 0.18);
+  --down: rgba(208, 59, 59, 0.22);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 32px 0 8px; }
+.meta { color: var(--text-secondary); font-size: 13px; }
+table.details { width: auto; max-width: 100%; margin: 10px 0 0; }
+table.details th, table.details td { padding: 3px 16px 3px 0; }
+table.details th { font-weight: 500; white-space: nowrap; }
+table.details code { font: 12px ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
+table.details .note { color: var(--text-muted); margin-left: 8px; }
+details.details-more > summary { font-size: 13px; margin: 6px 0 0; }
+.hypothesis { max-width: 80ch; margin: 12px 0 0; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-weight: 600; font-size: 13px; padding: 2px 10px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--grid);
+}
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--text-secondary); font-size: 12px; margin: 4px 0 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+.panel { position: relative; }
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--text-secondary); font-size: 11px; }
+.axis line, .gridline { stroke: var(--grid); }
+.chart-title { font-weight: 600; font-size: 13px; margin: 16px 0 0; }
+.chart-sub { color: var(--text-muted); font-size: 12px; }
+.chart-desc { color: var(--text-secondary); font-size: 12px; max-width: 80ch; margin: 2px 0 6px; }
+.other-charts > summary { color: var(--text-secondary); font-size: 13px; margin: 20px 0 0; }
+.tooltip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface); color: var(--text-primary); border: 1px solid var(--grid);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; max-width: 320px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+.tooltip .muted { color: var(--text-muted); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; vertical-align: top; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--text-secondary); font-weight: 600; }
+td.output { font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); }
+.table-wrap { overflow-x: auto; }
+details summary { cursor: pointer; color: var(--text-secondary); margin: 8px 0; }
+.errors { color: var(--critical); }
+.empty { color: var(--text-muted); }
+</style>
+</head>
+<body>
+<main>
+  <header id="header"></header>
+  <section>
+    <h2>Instances and faults</h2>
+    <div class="legend" id="lane-legend"></div>
+    <div class="panel" id="lanes"></div>
+  </section>
+  <section>
+    <h2>Metrics</h2>
+    <div class="legend" id="metric-legend"></div>
+    <div id="charts"></div>
+  </section>
+  <section>
+    <h2>Checks</h2>
+    <div class="table-wrap" id="checks"></div>
+  </section>
+  <section>
+    <h2>Timeline</h2>
+    <details><summary>Every timeline event</summary><div class="table-wrap" id="events"></div></details>
+  </section>
+</main>
+<div class="tooltip" id="tooltip"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const NS = "http://www.w3.org/2000/svg";
+const LEFT = 132, RIGHT = 16, LANE = 22, LANE_GAP = 6, AXIS = 22;
+const STATE_COLOR = {
+  Running: "var(--series-1)", Succeeded: "var(--good)", Failed: "var(--critical)",
+  Error: "var(--critical)", Unknown: "var(--warning)", Created: "var(--grid)",
+};
+const stateColor = s => STATE_COLOR[s] || "var(--neutral)";
+const VERDICT = { PASS: ["var(--good)", "PASS"], XFAIL: ["var(--neutral)", "XFAIL (known failures only)"], FAIL: ["var(--critical)", "FAIL"], ERROR: ["var(--warning)", "ERROR"] };
+const tip = document.getElementById("tooltip");
+const crosshairs = [];
+
+function el(tag, attrs = {}, parent) {
+  const node = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+function html(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (cls) node.className = cls;
+  return node;
+}
+const fmtT = t => (t == null ? "" : `${t.toFixed(1)}s`);
+function fmtV(v) {
+  if (v == null) return "no data";
+  const a = Math.abs(v);
+  if (a !== 0 && (a < 0.01 || a >= 1e6)) return v.toExponential(2);
+  return Number(v.toFixed(a < 10 ? 3 : 1)).toLocaleString();
+}
+
+function scale(width) {
+  const end = Math.max(D.end, 1);
+  const w = width - LEFT - RIGHT;
+  return { x: t => LEFT + (t / end) * w, t: x => ((x - LEFT) / w) * end, end, w };
+}
+function ticks(end) {
+  const raw = end / 8;
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
+  const step = steps.find(s => s >= raw) || 3600;
+  const out = [];
+  for (let t = 0; t <= end + 1e-9; t += step) out.push(t);
+  return out;
+}
+function axis(svg, sx, y, height) {
+  const g = el("g", { class: "axis" }, svg);
+  for (const t of ticks(sx.end)) {
+    el("line", { x1: sx.x(t), x2: sx.x(t), y1: 0, y2: height, class: "gridline" }, g);
+    const label = el("text", { x: sx.x(t), y: y + 14, "text-anchor": "middle" }, g);
+    label.textContent = `${t}s`;
+  }
+}
+function faultBands(svg, sx, height, labels) {
+  for (const f of D.faults) {
+    const x1 = sx.x(f.from), x2 = sx.x(f.to);
+    if (x2 - x1 < 2) {
+      el("line", { x1, x2: x1, y1: 0, y2: height, stroke: "var(--text-secondary)", "stroke-width": 1.5, "stroke-dasharray": "3 3" }, svg);
+    } else {
+      el("rect", { x: x1, y: 0, width: x2 - x1, height, fill: "var(--band)" }, svg);
+    }
+    if (labels) {
+      const t = el("text", { x: x1 + 3, y: -4 }, svg);
+      t.textContent = `${f.name} (${f.uses})`;
+    }
+  }
+}
+function crosshair(svg, height) {
+  const line = el("line", { y1: 0, y2: height, stroke: "var(--text-muted)", "stroke-width": 1, visibility: "hidden" }, svg);
+  crosshairs.push(line);
+}
+function moveCrosshairs(x) {
+  for (const line of crosshairs) {
+    line.setAttribute("x1", x); line.setAttribute("x2", x);
+    line.setAttribute("visibility", x == null ? "hidden" : "visible");
+  }
+}
+function showTip(evt, nodes) {
+  tip.replaceChildren(...nodes);
+  tip.style.display = "block";
+  const pad = 12, r = tip.getBoundingClientRect();
+  let left = evt.clientX + pad, top = evt.clientY + pad;
+  if (left + r.width > window.innerWidth - 8) left = evt.clientX - r.width - pad;
+  if (top + r.height > window.innerHeight - 8) top = evt.clientY - r.height - pad;
+  tip.style.left = `${Math.max(8, left)}px`; tip.style.top = `${Math.max(8, top)}px`;
+}
+function hideTip() { tip.style.display = "none"; moveCrosshairs(null); }
+function hover(svg, sx, describe) {
+  svg.addEventListener("pointermove", evt => {
+    const box = svg.getBoundingClientRect();
+    const x = evt.clientX - box.left, y = evt.clientY - box.top;
+    if (x < LEFT || x > LEFT + sx.w) return hideTip();
+    moveCrosshairs(x);
+    const t = sx.t(x);
+    const lines = describe(t, y, x);
+    showTip(evt, [html("div", `t = ${fmtT(t)}`, "muted"), ...lines]);
+  });
+  svg.addEventListener("pointerleave", hideTip);
+}
+
+function header() {
+  const h = document.getElementById("header");
+  const e = D.experiment;
+  h.appendChild(html("h1", e.title || e.id || "Chaos run"));
+  const [color, word] = VERDICT[D.verdict] || ["var(--neutral)", D.verdict || "no verdict"];
+  const badge = html("span", "", "badge");
+  const dot = html("span", "", "dot"); dot.style.background = color;
+  badge.append(dot, word);
+  const meta = html("div", "", "meta");
+  meta.append(badge);
+  h.appendChild(meta);
+  const rows = D.details || [];
+  const detailsTable = list => {
+    const table = html("table", "", "details");
+    for (const r of list) {
+      const tr = html("tr");
+      const td = html("td");
+      td.append(r.code ? html("code", r.value) : r.value);
+      if (r.note) td.append(html("span", r.note, "note"));
+      tr.append(html("th", r.key), td);
+      table.appendChild(tr);
+    }
+    return table;
+  };
+  h.appendChild(detailsTable(rows.filter(r => !r.more)));
+  const more = rows.filter(r => r.more);
+  if (more.length) {
+    const fold = html("details", "", "details-more");
+    fold.append(html("summary", "Gateway binary and images"), detailsTable(more));
+    h.appendChild(fold);
+  }
+  if (e.hypothesis) {
+    const p = html("p", "", "hypothesis");
+    p.append(html("strong", "Hypothesis. "), e.hypothesis);
+    h.appendChild(p);
+  }
+  if (e.expectations && e.expectations.length) {
+    const p = html("p", "", "hypothesis");
+    p.append(html("strong", "Expectations. "));
+    e.expectations.forEach((x, n) => {
+      const link = /^https?:/.test(x.issue) ? x.issue
+        : `https://github.com/${x.issue.split("#")[0]}/issues/${x.issue.split("#")[1]}`;
+      const a = html("a", x.issue); a.href = link;
+      const checks = x.checks || [];
+      const kind = x.kind === "flaky" ? "known to fail, flaky" : "known to fail";
+      const where = x.instances === "affected" ? " on affected instances" : "";
+      p.append(n ? "; " : "", a, checks.length ? ` (${kind}${where}: ${checks.join(", ")})` : " (regression test)");
+    });
+    h.appendChild(p);
+  }
+  if (D.errors.length) {
+    const ul = html("ul", "", "errors");
+    for (const err of D.errors) ul.appendChild(html("li", err));
+    h.appendChild(ul);
+  }
+}
+
+function legendItem(parent, swatchStyle, label, round) {
+  const span = html("span");
+  const sw = html("span", "", round ? "dot" : "swatch");
+  Object.assign(sw.style, swatchStyle);
+  span.append(sw, label);
+  parent.appendChild(span);
+}
+
+function lanes() {
+  const legend = document.getElementById("lane-legend");
+  const states = new Set(D.lanes.flatMap(l => l.segments.map(s => s.state)));
+  for (const s of ["Created", "Pending", "Running", "Unknown", "Succeeded", "Failed", "Error"]) {
+    if (states.has(s)) legendItem(legend, { background: stateColor(s) }, s);
+  }
+  for (const s of states) {
+    if (!["Created", "Pending", "Running", "Unknown", "Succeeded", "Failed", "Error"].includes(s)) legendItem(legend, { background: stateColor(s) }, s);
+  }
+  if (D.faults.length) legendItem(legend, { background: "var(--band-strong)" }, "fault window (darker on the targeted instances)");
+  legendItem(legend, { background: "var(--text-secondary)" }, "harness event", true);
+  legendItem(legend, { background: "transparent", border: "2px solid var(--text-primary)" }, "docker event", true);
+
+  const host = document.getElementById("lanes");
+  host.replaceChildren();
+  if (!D.lanes.length) { host.appendChild(html("p", "No instances.", "empty")); return; }
+  const width = host.clientWidth || 900;
+  const sx = scale(width);
+  const rows = [{ name: "run", run: true }, ...D.lanes];
+  const top = 18;
+  const height = top + rows.length * (LANE + LANE_GAP);
+  const svg = el("svg", { viewBox: `0 0 ${width} ${height + AXIS}`, height: height + AXIS, role: "img", "aria-label": "Instance states over time" }, host);
+  const plot = el("g", { transform: `translate(0, ${top})` }, svg);
+  const plotH = height - top;
+  axis(plot, sx, plotH, plotH);
+  faultBands(plot, sx, plotH, true);
+  const laneY = i => i * (LANE + LANE_GAP);
+  rows.forEach((row, i) => {
+    const y = laneY(i);
+    const label = el("text", { x: LEFT - 8, y: y + LANE / 2 + 4, "text-anchor": "end" }, plot);
+    label.textContent = row.name;
+    if (row.run) {
+      for (const ev of D.events) {
+        el("circle", { cx: sx.x(ev.t), cy: y + LANE / 2, r: 4, fill: "var(--text-secondary)", stroke: "var(--surface)", "stroke-width": 2 }, plot);
+      }
+      return;
+    }
+    for (const f of D.faults) {
+      if (f.instances.includes(row.name) && f.to - f.from > 0) {
+        el("rect", { x: sx.x(f.from), y: y - 2, width: sx.x(f.to) - sx.x(f.from), height: LANE + 4, fill: "var(--band-strong)" }, plot);
+      }
+    }
+    for (const s of row.segments) {
+      const x1 = sx.x(s.from), x2 = sx.x(s.to);
+      el("rect", { x: x1, y: y + 4, width: Math.max(1, x2 - x1 - 2), height: LANE - 8, rx: 3, fill: stateColor(s.state) }, plot);
+    }
+    for (const m of row.marks) {
+      const attrs = m.kind === "docker"
+        ? { fill: "var(--surface)", stroke: "var(--text-primary)", "stroke-width": 2 }
+        : { fill: "var(--text-secondary)", stroke: "var(--surface)", "stroke-width": 2 };
+      el("circle", { cx: sx.x(m.t), cy: y + LANE / 2, r: 4, ...attrs }, plot);
+    }
+  });
+  crosshair(plot, plotH);
+  hover(svg, sx, (t, y, x) => {
+    const i = Math.floor((y - top) / (LANE + LANE_GAP));
+    const row = rows[i];
+    const out = [];
+    const near = m => Math.abs(sx.x(m.t) - x) <= 6;
+    if (!row) return out;
+    if (row.run) {
+      for (const ev of D.events.filter(near)) out.push(html("div", `${fmtT(ev.t)} ${ev.label}`));
+    } else {
+      const seg = row.segments.find(s => t >= s.from && t <= s.to);
+      out.push(html("div", `${row.name}: ${seg ? seg.state : "not present"}`));
+      for (const m of row.marks.filter(near)) out.push(html("div", `${fmtT(m.t)} ${m.label}`));
+    }
+    for (const f of D.faults) {
+      if (t >= f.from && t <= f.to) out.push(html("div", `fault ${f.name} (${f.uses}) ${fmtT(f.from)}–${fmtT(f.to)}`, "muted"));
+    }
+    return out;
+  });
+}
+
+// Whether the reader opened the undeclared charts; kept across re-renders.
+let othersOpen = false;
+
+function charts() {
+  const legend = document.getElementById("metric-legend");
+  const host = document.getElementById("charts");
+  host.replaceChildren(); legend.replaceChildren();
+  const metrics = D.metrics || [];
+  if (!D.charts.length && !metrics.length) {
+    host.appendChild(html("p", "No metrics recorded. The adapter lists the endpoints to scrape under metrics:.", "empty"));
+    return;
+  }
+  if (D.charts.length) {
+    if (D.faults.length) legendItem(legend, { background: "var(--band-strong)" }, "fault window");
+    if (D.down.length) legendItem(legend, { background: "var(--down)" }, "metrics endpoint did not answer");
+  }
+  const width = host.clientWidth || 900;
+  const sx = scale(width);
+  // The experiment's metrics: first, with their descriptions; a family that
+  // no scrape had gets a placeholder so its absence is visible.
+  for (const m of metrics) {
+    const mine = D.charts.filter(c => c.declared && c.family === m.family);
+    if (!mine.length) {
+      host.appendChild(html("div", m.family, "chart-title"));
+      if (m.description) host.appendChild(html("div", m.description, "chart-desc"));
+      host.appendChild(html("p", D.charts.length ? "Not in any scrape of this run." : "No scrape recorded this family.", "empty"));
+      continue;
+    }
+    mine.forEach((c, i) => chart(host, c, width, sx, i === 0 ? m.description : ""));
+  }
+  const others = D.charts.filter(c => !c.declared);
+  if (!others.length) return;
+  if (!metrics.length) {
+    for (const c of others) chart(host, c, width, sx, "");
+    return;
+  }
+  // Everything else the run scraped, folded away: recorded, not declared.
+  const details = html("details", "", "other-charts");
+  details.open = othersOpen;
+  details.appendChild(html("summary", `Other metrics the run scraped (${others.length} chart${others.length === 1 ? "" : "s"})`));
+  details.addEventListener("toggle", () => { othersOpen = details.open; });
+  host.appendChild(details);
+  for (const c of others) chart(details, c, width, sx, "");
+}
+
+function chart(host, c, width, sx, description) {
+  const H = 110;
+  host.append(html("div", c.title, "chart-title"), html("div", `${c.subtitle} · ${c.source}`, "chart-sub"));
+  if (description) host.appendChild(html("div", description, "chart-desc"));
+  const values = c.points.map(p => p[1]).filter(v => v != null);
+  const max = Math.max(...values, 0), min = Math.min(...values, 0);
+  const span = max - min || 1;
+  const sy = v => 8 + (H - 8) * (1 - (v - min) / span);
+  const svg = el("svg", { viewBox: `0 0 ${width} ${H + AXIS}`, height: H + AXIS, role: "img", "aria-label": c.title }, host);
+  axis(svg, sx, H, H);
+  for (const d of D.down.filter(d => d.source === c.source)) {
+    el("rect", { x: sx.x(d.from), y: 0, width: Math.max(2, sx.x(d.to) - sx.x(d.from)), height: H, fill: "var(--down)" }, svg);
+  }
+  faultBands(svg, sx, H, false);
+  for (const v of [min, max]) {
+    const t = el("text", { x: LEFT - 8, y: sy(v) + 4, "text-anchor": "end" }, svg);
+    t.textContent = fmtV(v);
+  }
+  el("line", { x1: LEFT, x2: LEFT + sx.w, y1: sy(0), y2: sy(0), stroke: "var(--text-muted)", "stroke-width": 1 }, svg);
+  let d = "", pen = false;
+  c.points.forEach(([t, v], i) => {
+    if (v == null) { pen = false; return; }
+    d += `${pen ? "L" : "M"}${sx.x(t).toFixed(1)},${sy(v).toFixed(1)}`;
+    pen = true;
+    // A value between two gaps has no line to sit on; draw it as a dot.
+    const next = c.points[i + 1];
+    const prevGap = i === 0 || c.points[i - 1][1] == null;
+    if (prevGap && (!next || next[1] == null)) {
+      el("circle", { cx: sx.x(t), cy: sy(v), r: 3, fill: "var(--series-1)" }, svg);
+    }
+  });
+  el("path", { d, fill: "none", stroke: "var(--series-1)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  const dot = el("circle", { r: 4, fill: "var(--series-1)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" }, svg);
+  crosshair(svg, H);
+  hover(svg, sx, t => {
+    let best = null;
+    for (const p of c.points) if (best == null || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+    if (!best) return [];
+    if (best[1] != null) {
+      dot.setAttribute("cx", sx.x(best[0])); dot.setAttribute("cy", sy(best[1])); dot.setAttribute("visibility", "visible");
+    } else dot.setAttribute("visibility", "hidden");
+    return [html("div", `${c.title}: ${fmtV(best[1])}`), html("div", `scraped at ${fmtT(best[0])}`, "muted")];
+  });
+  svg.addEventListener("pointerleave", () => dot.setAttribute("visibility", "hidden"));
+}
+
+function table(host, head, rows) {
+  const t = html("table");
+  const tr = html("tr");
+  for (const h of head) tr.appendChild(html("th", h));
+  const thead = html("thead"); thead.appendChild(tr); t.appendChild(thead);
+  const tbody = html("tbody");
+  for (const r of rows) {
+    const row = html("tr");
+    for (const cell of r) {
+      if (cell instanceof Node) { const td = html("td"); td.appendChild(cell); row.appendChild(td); }
+      else row.appendChild(html("td", cell == null ? "" : String(cell), cell && cell.cls));
+    }
+    tbody.appendChild(row);
+  }
+  t.appendChild(tbody);
+  host.appendChild(t);
+}
+
+function checks() {
+  const host = document.getElementById("checks");
+  if (!D.results.length) { host.appendChild(html("p", "No check results.", "empty")); return; }
+  const rows = [...D.results]
+    .sort((a, b) => Number(a.ok) - Number(b.ok))
+    .map(r => {
+      const status = html("span", "", "badge");
+      const dot = html("span", "", "dot");
+      const [color, word] = r.error ? ["var(--critical)", "error: the check could not decide"]
+        : !r.issue ? (r.ok ? ["var(--good)", "pass"] : ["var(--critical)", "fail"])
+        : r.ok && r.flaky ? ["var(--good)", `pass (flaky: ${r.issue} did not trigger)`]
+        : r.ok ? ["var(--critical)", `unexpected pass (${r.issue})`]
+        : ["var(--neutral)", `known ${r.flaky ? "flaky " : ""}failure (${r.issue})`];
+      dot.style.background = color;
+      status.append(dot, word);
+      const out = html("div", (r.output || "").trim()); out.className = "output";
+      const where = r.instance || r.scope;
+      return [status, where, r.check, r.description, out];
+    });
+  table(host, ["Result", "Scope", "Check", "Description", "Output"], rows);
+  for (const td of host.querySelectorAll("td:last-child")) td.className = "output";
+}
+
+function events() {
+  const host = document.getElementById("events");
+  const rows = D.timeline.map(e => {
+    const { t, ts, event, ...rest } = e;
+    return [fmtT(t), event, JSON.stringify(rest)];
+  });
+  table(host, ["t", "Event", "Fields"], rows);
+  for (const td of host.querySelectorAll("td:last-child")) td.className = "output";
+}
+
+function render() { crosshairs.length = 0; lanes(); charts(); }
+header(); render(); checks(); events();
+let pending;
+window.addEventListener("resize", () => { clearTimeout(pending); pending = setTimeout(() => { document.getElementById("lane-legend").replaceChildren(); render(); }, 150); });
+</script>
+</body>
+</html>

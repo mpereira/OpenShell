@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: hello-world
+version: 1
+title: A sandbox says hello
+hypothesis: >
+  One hello instance runs its script to exit code 0, and the file greeting in
+  its output directory holds the line "hello, world".
+description: >
+  The smallest experiment: one workload with one instance, two checks and no
+  faults. The README walks through it. A FAIL or ERROR points at the harness,
+  the adapter hooks or the environment. The checks encode desired behaviour.
+default-adapter: openshell-docker
+timeout: 5m
+
+workloads:
+  - name: hello
+    description: Writes the line "hello, world" to the file greeting in its output directory.
+    kind: shell
+    instances: 1
+    timeout: 2m
+    run: |
+      echo "hello, world" > "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/greeting"
+    checks:
+      - name: exited-ok
+        description: "For each hello instance: the script exited with code 0."
+        kind: exit-code
+        equals: 0
+      - name: said-hello
+        description: 'For each hello instance: the file greeting holds the line "hello, world".'
+        kind: shell
+        run: |
+          grep -qx "hello, world" "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/greeting"
+
+flow: hello
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_server_grpc_requests_total
+    description: >
+      gRPC requests the gateway handled, by method and status. The harness's
+      own calls (create, status, delete) are in it, so the rate shows the load
+      the experiment puts on the gateway.

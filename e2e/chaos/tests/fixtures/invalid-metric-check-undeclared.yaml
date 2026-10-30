@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: invalid-metric-check-undeclared
+version: 1
+title: t
+hypothesis: h
+description: d
+default-adapter: openshell-docker
+workloads:
+  - name: w
+    description: d
+    kind: shell
+    instances: 1
+    timeout: 1m
+    run: "true"
+    checks: [{name: ok, description: d, kind: exit-code, equals: 0}]
+flow: w
+metrics: [up_gauge]
+checks:
+  - {name: m, description: d, kind: metric, metric: other_total, value: increase, at-most: 0}

@@ -574,6 +574,8 @@ fi
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
+# Prometheus /metrics, scraped by the chaos harness.
+METRICS_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
@@ -588,6 +590,16 @@ ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
+export OPENSHELL_E2E_METRICS_PORT="${METRICS_PORT}"
+# Opt-in OTLP/gRPC trace export to 127.0.0.1:OPENSHELL_E2E_OTLP_PORT. The chaos
+# harness runs the collector there and waits on the gateway's spans.
+OTLP_PORT=""
+if [ "${OPENSHELL_E2E_GATEWAY_OTLP:-0}" = "1" ]; then
+  OTLP_PORT=$(e2e_pick_port)
+  export OPENSHELL_E2E_OTLP_PORT="${OTLP_PORT}"
+  # Export finished spans within ~200ms instead of the SDK's 5s default.
+  export OTEL_BSP_SCHEDULE_DELAY="${OTEL_BSP_SCHEDULE_DELAY:-200}"
+fi
 export OPENSHELL_E2E_DRIVER="docker"
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
   export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor"
@@ -650,10 +662,15 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'additional_ca_bundle = %s\n\n' \
       "$(toml_string "${ADDITIONAL_CA_DIR}/ca.crt")"
   fi
-  # Opt-in OTLP export so the otlp_relay e2e can bind a collector stub on
-  # the referenced port. Supervisors connect lazily, so the gateway may
-  # start before the stub exists.
-  if [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
+  # Opt-in OTLP export. The chaos harness (OPENSHELL_E2E_GATEWAY_OTLP=1)
+  # runs a collector on the picked port and waits on the gateway's spans.
+  # Otherwise OPENSHELL_E2E_OTLP_ENDPOINT lets the otlp_relay e2e bind a
+  # collector stub on the referenced port. Supervisors connect lazily, so
+  # the gateway may start before the stub exists.
+  if [ -n "${OTLP_PORT}" ]; then
+    printf '[openshell.gateway.otlp]\nendpoint = %s\n\n' \
+      "$(toml_string "http://127.0.0.1:${OTLP_PORT}")"
+  elif [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
     printf '[openshell.gateway.otlp]\n'
     printf 'endpoint = %s\n\n' "$(toml_string "${OPENSHELL_E2E_OTLP_ENDPOINT}")"
     # The agent trace relay is opt-in; OPENSHELL_E2E_OTLP_AGENT=0 runs the
@@ -710,6 +727,7 @@ GATEWAY_ARGS=(
   --bind-address "${GATEWAY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
+  --metrics-port "${METRICS_PORT}"
   --compute-driver docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"

@@ -1,0 +1,401 @@
+{
+  "uid": "chaos-run",
+  "title": "Chaos run",
+  "tags": [
+    "chaos"
+  ],
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "",
+  "graphTooltip": 1,
+  "description": "One chaos experiment run, loaded with e2e/chaos/grafana/view.sh.",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Events",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "chaos-prometheus"
+        },
+        "enable": true,
+        "iconColor": "#52514e",
+        "expr": "chaos_event{run_id=\"$run\"}",
+        "step": "1s",
+        "useValueForTime": true,
+        "titleFormat": "{{instance}}",
+        "textFormat": "{{label}}",
+        "tagKeys": "instance"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "run",
+        "label": "Run",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "chaos-prometheus"
+        },
+        "query": {
+          "query": "label_values(chaos_run_info, run_id)",
+          "refId": "run"
+        },
+        "definition": "label_values(chaos_run_info, run_id)",
+        "refresh": 2,
+        "sort": 2,
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "chart",
+        "label": "Metric",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "chaos-prometheus"
+        },
+        "query": {
+          "query": "label_values(chaos_chart{run_id=\"$run\"}, title)",
+          "refId": "chart"
+        },
+        "definition": "label_values(chaos_chart{run_id=\"$run\"}, title)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Run",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "chaos-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "chaos-prometheus"
+          },
+          "expr": "max by (run_id, experiment, verdict, adapter) (max_over_time(chaos_run_info{run_id=\"$run\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            },
+            "indexByName": {
+              "experiment": 0,
+              "verdict": 1,
+              "run_id": 2,
+              "adapter": 3
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 2,
+      "type": "state-timeline",
+      "title": "Instances",
+      "description": "One row per instance: the state the harness saw. Annotations mark harness and docker events.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "chaos-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "chaos-prometheus"
+          },
+          "expr": "chaos_instance_state{run_id=\"$run\"}",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Created",
+                  "color": "#c7c6c0",
+                  "index": 0
+                },
+                "1": {
+                  "text": "Pending",
+                  "color": "#9e9d97",
+                  "index": 1
+                },
+                "2": {
+                  "text": "Running",
+                  "color": "#2a78d6",
+                  "index": 2
+                },
+                "3": {
+                  "text": "Unknown",
+                  "color": "#fab219",
+                  "index": 3
+                },
+                "4": {
+                  "text": "Succeeded",
+                  "color": "#0ca30c",
+                  "index": 4
+                },
+                "5": {
+                  "text": "Failed",
+                  "color": "#d03b3b",
+                  "index": 5
+                },
+                "6": {
+                  "text": "Error",
+                  "color": "#d03b3b",
+                  "index": 6
+                },
+                "7": {
+                  "text": "Other",
+                  "color": "#6f6e69",
+                  "index": 7
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "transparent"
+          },
+          "custom": {
+            "fillOpacity": 85,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "state-timeline",
+      "title": "Faults",
+      "description": "When each fault was applied and undone (or its target restarted).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "chaos-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "chaos-prometheus"
+          },
+          "expr": "chaos_fault_active{run_id=\"$run\"}",
+          "legendFormat": "{{operation}} ({{uses}})",
+          "range": true,
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "not applied",
+                  "color": "transparent",
+                  "index": 0
+                },
+                "1": {
+                  "text": "applied",
+                  "color": "#ec835a",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "transparent"
+          },
+          "custom": {
+            "fillOpacity": 85,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Metrics",
+      "id": 5,
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "$chart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "chaos-prometheus"
+      },
+      "repeat": "chart",
+      "repeatDirection": "h",
+      "maxPerRow": 2,
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 12,
+        "h": 8
+      },
+      "description": "The report's metric charts: counters as per-second rates, histogram sums as the mean per observation.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "chaos-prometheus"
+          },
+          "expr": "chaos_chart{run_id=\"$run\", title=\"$chart\"}",
+          "legendFormat": "{{detail}} ({{source}})",
+          "range": true,
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#2a78d6"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "drawStyle": "line"
+          },
+          "noValue": "No metrics recorded for this run"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    }
+  ]
+}

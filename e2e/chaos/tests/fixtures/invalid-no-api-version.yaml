@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: invalid-no-api-version
+version: 1
+title: t
+hypothesis: h
+description: d
+default-adapter: openshell-docker
+workloads:
+  - name: w
+    description: d
+    kind: shell
+    instances: 1
+    timeout: 1m
+    run: "true"
+    checks: [{name: ok, description: d, kind: exit-code, equals: 0}]
+flow: w

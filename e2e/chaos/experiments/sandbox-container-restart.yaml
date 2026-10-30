@@ -1,0 +1,142 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: sandbox-container-restart
+version: 2
+title: A sandbox returns to Ready after its container restarts
+hypothesis: >
+  When the sandbox container of a Ready sandbox is restarted in place, the
+  sandbox returns to Ready without user action, the counter script in it is
+  started again under restart-policy on-failure, and the instance's journal
+  still has every tick from 1 to $TICKS.
+description: >
+  Two counter instances run with restart-policy on-failure. 10s after both
+  have been observed running, restart-sandbox restarts the sandbox container
+  of one of them in place, picked by a random generator seeded with --seed
+  and the fault name. This is the container that runs the workload. The
+  other instance gets no fault: if it passes and the restarted one fails,
+  the restart caused the failure. The container runtime stops the container
+  and starts the same one again, as a runtime restart or host maintenance
+  would.
+default-adapter: openshell-docker
+timeout: 15m
+
+expectations:
+  - issue: NVIDIA/OpenShell#4828
+    # The sandbox goes to Error after the restart and never returns to Ready.
+    # The restarted sandbox runtime exits 1 because it deleted its one-time
+    # bootstrap.json on first start; about 50s later the supervisor exits 1
+    # and the driver stops the sandbox. With
+    # --set operations.restart-sandbox.target.role=supervisor, the driver treats
+    # the supervisor's exit 143 as ControlSupervisorExited and stops the
+    # sandbox within a second. In both runs the gateway accepted only the
+    # first supervisor session, so the reconnect that the gateway fix in
+    # review, NVIDIA/OpenShell#4865, accepts while in Error never happens.
+    # That fix likely does not change this result; not yet run against it.
+    checks: [counter/exited-ok, counter/journal-complete, counter/back-to-running]
+    # Only the restarted instance; the other one is the control and must pass.
+    instances: affected
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds. Each tick
+      appends the line "<tick> <unix time>" to the instance's journal, then
+      saves the tick number atomically. If the script is started again in the
+      same output directory, it continues from the saved tick plus one.
+    kind: shell
+    instances: 2
+    timeout: 5m
+    env: {TICKS: "60", INTERVAL: "1"}
+    options: {restart-policy: on-failure}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0. An instance with no recorded exit code fails.
+        kind: exit-code
+        equals: 0
+      - name: journal-complete
+        description: >
+          For each counter instance: the journal has every tick from 1 to
+          $TICKS. A tick may appear twice, because a script that is started
+          again can repeat the tick the previous attempt was stopped on. A
+          missing tick fails.
+        kind: shell
+        run: |
+          journal=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR/journal
+          if ! missing=$(diff <(seq 1 "$TICKS") <(cut -d" " -f1 "$journal" | sort -un)); then
+            echo "$missing" | head -5
+            echo "want each tick from 1 to $TICKS at least once"
+            exit 1
+          fi
+      - name: back-to-running
+        description: >
+          For the restarted counter instance: after restart-sandbox selected
+          it, every Pending, Unknown or Failed state the run recorded for it
+          is followed by Running, so the sandbox was Ready again. A Failed
+          with no Running after it is the restart ending the sandbox for
+          good. A restart too fast to observe records no state change and
+          passes. The other instance passes.
+        kind: shell
+        run: |
+          jq -se --arg i "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME" '
+            . as $e
+            | ($e | map(.event == "operation.started" and .operation == "restart-sandbox"
+                        and (.instances | index($i) != null)) | index(true)) as $selected
+            | $selected == null
+              or ([$e[$selected:][] | select(.event == "instance.state" and .instance == $i) | .state]
+                  | (map(. == "Pending" or . == "Unknown" or . == "Failed") | rindex(true)) as $down
+                  | $down == null or (.[$down:] | index("Running")) != null)
+          ' "$CHAOS_EXPERIMENT_RUN_DIR/timeline.jsonl" >/dev/null \
+            || { echo "$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_NAME was not Running after the restart"; exit 1; }
+
+operations:
+  - name: restart-sandbox
+    description: >
+      Restarts the sandbox container of one counter instance in place,
+      picked as the experiment description says.
+    uses: restart-in-place
+    target: {workload: counter, role: sandbox}
+    select: {count: 1}
+
+flow:
+  parallel:
+    - counter
+    - serial: [{wait: {workload: counter, condition: started}}, {delay: 10s}, restart-sandbox]
+
+checks:
+  - name: all-supervisors-connected
+    description: >
+      At some scrape all 2 counter instances had their supervisor session
+      registered on the gateway, so the metric saw the full workload.
+    kind: metric
+    metric: openshell_server_supervisor_sessions
+    value: max
+    at-least: 2
+
+metrics:
+  - family: openshell_server_supervisor_sessions
+    description: >
+      Supervisor sessions registered on the gateway: one per sandbox whose
+      supervisor is connected. It follows the instance count while sandboxes
+      run, and drops while a sandbox is restarting.
+  - family: openshell_supervisor_policy_apply_results_total
+    description: >
+      Policy applies the supervisors reported, by outcome. A sandbox that
+      reconnects to the restarted gateway applies its policy again, so the
+      counter steps once per surviving sandbox.
+  - family: openshell_server_grpc_requests_total
+    description: >
+      gRPC requests the gateway handled, by method and status. The harness's
+      own calls (create, status, delete) are in it, so the rate shows the load
+      the experiment puts on the gateway.

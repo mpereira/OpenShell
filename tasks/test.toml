@@ -194,6 +194,31 @@ run = [
   "OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=openshell/e2e-python:dev OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=never e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py *_test.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python",
 ]
 
+["e2e:chaos"]
+description = "Run one chaos experiment against a Docker-backed gateway (pass the file: mise run e2e:chaos e2e/chaos/experiments/smoke.yaml)"
+env = { UV_PYTHON_INSTALL_DIR = "{{env.HOME}}/.local/share/uv/python", OPENSHELL_E2E_GATEWAY_OTLP = "1" }
+run = "e2e/with-docker-gateway.sh uv run --project e2e/chaos chaos run"
+
+["e2e:chaos:preflight"]
+description = "Run only an experiment's preflight checks against a Docker-backed gateway (pass the file)"
+env = { UV_PYTHON_INSTALL_DIR = "{{env.HOME}}/.local/share/uv/python", OPENSHELL_E2E_GATEWAY_OTLP = "1" }
+run = "e2e/with-docker-gateway.sh uv run --project e2e/chaos chaos preflight"
+
+["e2e:chaos:check"]
+description = "Run the hello-world and smoke chaos experiments against a Docker-backed gateway and fail unless both verdicts are PASS"
+env = { UV_PYTHON_INSTALL_DIR = "{{env.HOME}}/.local/share/uv/python", OPENSHELL_E2E_GATEWAY_OTLP = "1" }
+run = "e2e/with-docker-gateway.sh e2e/chaos/scripts/check.sh"
+
+["e2e:chaos:share"]
+description = "Write a Markdown page of a chaos run with Mermaid charts, to paste into an issue or a post (pass the run dir; --png also renders the charts with mermaid-cli)"
+env = { UV_PYTHON_INSTALL_DIR = "{{env.HOME}}/.local/share/uv/python" }
+run = "uv run --project e2e/chaos chaos share"
+
+["e2e:chaos:grafana"]
+description = "Load chaos runs into a local Prometheus and Grafana (pass run dirs: mise run e2e:chaos:grafana e2e/chaos/runs/smoke/<run-id>; --down stops it)"
+env = { UV_PYTHON_INSTALL_DIR = "{{env.HOME}}/.local/share/uv/python" }
+run = "e2e/chaos/grafana/view.sh"
+
 ["e2e:podman"]
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
