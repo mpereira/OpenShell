@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: chaos/v1alpha1
+id: gateway-sigterm-during-recovery
+version: 1
+title: A SIGTERM during the gateway's startup recovery stops it gracefully
+hypothesis: >
+  When the gateway gets SIGTERM while its startup recovery sweep is starting
+  the persisted sandboxes again, it shuts down as it does after startup: it
+  logs the shutdown, leaves no driver operation pending, and the gateway that
+  starts next can start and delete every sandbox.
+description: >
+  Eight counter instances run. 15s after all have been observed running,
+  gateway-restart stops the gateway gracefully, which stops every sandbox,
+  and starts it again. The restarted gateway serves /healthz before its
+  recovery sweep, which starts the eight sandboxes one at a time, so 1s
+  after it is healthy gateway-sigterm-in-recovery sends SIGTERM while the
+  sweep is still running. On main the recovery sweep runs before the
+  SIGTERM handler is installed (crates/openshell-server/src/lib.rs), so
+  the process exits at once and the sandbox whose StartSandbox it had
+  claimed keeps driver_operation_pending. The next gateway retains that
+  operation, and the sandbox can then be neither started nor deleted, so
+  the run also records a failed delete and ends in ERROR.
+default-adapter: openshell-docker
+timeout: 15m
+
+workloads:
+  - name: counter
+    description: >
+      Counts from 1 to $TICKS, one tick every $INTERVAL seconds, saving the
+      tick so that a script started again resumes after it.
+    kind: shell
+    instances: 8
+    timeout: 4m
+    env: {TICKS: "90", INTERVAL: "1"}
+    run: |
+      out=$CHAOS_EXPERIMENT_WORKLOAD_INSTANCE_OUTPUT_DIR
+      start=$(cat "$out/counter" 2>/dev/null || echo 0)
+      for i in $(seq $((start + 1)) "$TICKS"); do
+        echo "$i $(date +%s)" >> "$out/journal"
+        echo "$i" > "$out/counter.tmp" && mv "$out/counter.tmp" "$out/counter"
+        sleep "$INTERVAL"
+      done
+    checks:
+      - name: exited-ok
+        description: >
+          For each counter instance: the last attempt of the script exited
+          with code 0, so the sandbox was started again after both restarts.
+        kind: exit-code
+        equals: 0
+
+operations:
+  - name: gateway-restart
+    description: >
+      Sends SIGTERM to the gateway process and, if it has not exited after
+      60s, SIGKILL. Then runs the adapter's start hook, which waits until the
+      gateway's /healthz returns 200.
+    uses: restart
+    target: gateway
+    select: one
+    grace-period: 60s
+  - name: gateway-sigterm-in-recovery
+    description: >
+      The same restart, sent while the restarted gateway's recovery sweep is
+      starting the stopped sandboxes.
+    uses: restart
+    target: gateway
+    select: one
+    grace-period: 60s
+
+flow:
+  parallel:
+    - counter
+    - serial:
+        - {wait: {workload: counter, condition: started}}
+        - {delay: 15s}
+        - gateway-restart
+        - {delay: 1s}
+        - gateway-sigterm-in-recovery
+
+checks:
+  - name: every-sigterm-logged
+    description: >
+      The gateway log has "Shutdown signal received; stopping gateway" at
+      least twice, once for each SIGTERM. A gateway that the default SIGTERM
+      disposition kills exits without logging it.
+    kind: shell
+    run: |
+      n=$(grep -c 'Shutdown signal received; stopping gateway' "$CHAOS_EXPERIMENT_RUN_DIR/logs/gateway.log" || true)
+      [ "$n" -ge 2 ] || { echo "want >= 2 graceful shutdowns, got $n"; exit 1; }
+  - name: no-pending-operation-retained
+    description: >
+      No gateway start retained a pending driver operation from the gateway
+      before it ("Retaining pending driver operation during gateway
+      recovery"). A retained operation blocks the sandbox's start, stop and
+      delete.
+    kind: shell
+    run: |
+      log=$CHAOS_EXPERIMENT_RUN_DIR/logs/gateway.log
+      if grep 'Retaining pending driver operation' "$log"; then
+        exit 1
+      fi
+
+expectations:
+  - issue: NVIDIA/OpenShell#4409
+    checks:
+      - experiment/every-sigterm-logged
+      - experiment/no-pending-operation-retained
+      - counter/exited-ok
+    kind: flaky

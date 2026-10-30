@@ -861,11 +861,12 @@ different writes the shell script and does not wait.
 | `gateway-kill-keeps-state` | Sandboxes survive a hard gateway kill. | `outage` | NVIDIA/OpenShell#4910 |
 | `policy-tighten-survives-gateway-restart` | A tightened policy stays in effect across a gateway restart. | `openshell-policy-set`, `outage` | NVIDIA/OpenShell#4910 |
 | `sandbox-stop-start` | A stopped sandbox starts again every time. | `openshell-sandbox-restart` | NVIDIA/OpenShell#4981, flaky |
+| `gateway-sigterm-during-recovery` | A SIGTERM during the gateway's startup recovery stops it gracefully. | `restart` | NVIDIA/OpenShell#4409, flaky |
 
 `chaos list` prints each experiment's id, version, title and issues, and
 `chaos show ID` describes one.
 [Demo](#demo) runs `hello-world` and [Write an
-experiment](#write-an-experiment) builds `sandbox-container-restart`. Four
+experiment](#write-an-experiment) builds `sandbox-container-restart`. Five
 more follow, each as the part of its manifest that shapes the run, with the
 `description` fields left out, and a chart of one run on `openshell-docker`,
 drawn from the run's `timeline.jsonl` in minutes and seconds since
@@ -1122,6 +1123,88 @@ for the whole ten minutes and all reached `Succeeded` between 10:30 and 10:55.
 which is when the workload node ended: the sweep wrote
 `Error (ContainerExited)` during a start and the start failed even though the
 new supervisor connected.
+
+### gateway-sigterm-during-recovery
+
+```yaml
+expectations:
+  - issue: NVIDIA/OpenShell#4409
+    checks:
+      - experiment/every-sigterm-logged
+      - experiment/no-pending-operation-retained
+      - counter/exited-ok
+    kind: flaky
+
+operations:
+  - name: gateway-restart
+    uses: restart
+    target: gateway
+    select: one
+    grace-period: 60s
+  - name: gateway-sigterm-in-recovery
+    uses: restart
+    target: gateway
+    select: one
+    grace-period: 60s
+
+flow:
+  parallel:
+    - counter
+    - serial:
+        - {wait: {workload: counter, condition: started}}
+        - {delay: 15s}
+        - gateway-restart
+        - {delay: 1s}
+        - gateway-sigterm-in-recovery
+```
+
+Eight counter instances run. The first restart stops the gateway gracefully,
+which stops every sandbox. The restarted gateway serves `/healthz` before its
+recovery sweep starts the eight sandboxes again, one at a time, so the second
+SIGTERM lands while the sweep is running. The sweep runs before the gateway
+installs its SIGTERM handler, so the process exits without logging
+`Shutdown signal received; stopping gateway`, and the sandbox whose start it
+had claimed keeps its pending driver operation. The next gateway logs
+`Retaining pending driver operation during gateway recovery`, and from then
+on refuses to start or delete that sandbox: `previous driver operation is
+still pending; retry and deletion are blocked`. The two `experiment` checks
+read the gateway log for both signs. Because the harness cannot delete the
+instance, the run ends `ERROR` with the instance's container left running,
+not `XFAIL`. A fixed gateway logs both shutdowns and the run ends `PASS`.
+
+Four runs on main at 3a5dfcd2f all ended this way, each with a different
+instance stuck. In each, the gateway after the kill also failed to start one
+or two of the sandboxes the interrupted sweep had already started again:
+`sandbox runtime is already bound to another supervisor process`. The chart
+shows the stuck instance of the first run:
+
+```mermaid
+gantt
+  dateFormat mm:ss
+  axisFormat %M:%S
+  section flow
+    workload counter                    :crit, 00:01, 06:04
+    wait counter started                :done, 00:01, 00:04
+    delay 15s                           :done, 00:04, 00:19
+    gateway-restart                     :done, 00:19, 00:23
+    delay 1s                            :done, 00:23, 00:24
+    gateway-sigterm-in-recovery         :crit, 00:24, 00:27
+    abort, delete refused               :milestone, crit, 06:04, 06:04
+  section counter-5
+    Running                             :active, 00:04, 00:21
+    Unknown                             :crit, 00:21, 00:23
+    Pending                             :00:23, 00:25
+    Unknown                             :crit, 00:25, 00:27
+    Running                             :active, 00:27, 01:52
+    Pending                             :01:52, 04:02
+    timed out, collected                :milestone, crit, 04:02, 04:02
+```
+
+`counter-5` reported `Running` after the second restart, but its supervisor
+never connected to the new gateway, and from 01:52 it was `Pending` with
+`SupervisorNotConnected` until its workload timeout. Every delete from 04:02
+was refused, and at 06:04 the harness aborted. The five instances the sweeps
+started cleanly reached `Succeeded` between 02:04 and 02:06.
 
 ## Adapters
 
