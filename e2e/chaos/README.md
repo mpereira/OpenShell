@@ -526,7 +526,10 @@ means a check that an expectation lists passed: the bug may be fixed.
 page to paste into an issue comment, a discussion or a post. It holds the
 verdict and the failed checks; a Mermaid gantt of the flow, with the
 workloads, waits, delays, operations and faults over one section per
-instance, one row per state; and, for each metric the experiment lists in
+instance, one row per state, in the colors `report.html` uses: green
+running or succeeded, amber pending, red unknown or failed, with a diamond
+where an instance was created or succeeded; and, for each metric the
+experiment lists in
 `metrics:`, its check results in a table and a Mermaid line chart, the first
 two open and the rest folded. GitHub draws Mermaid in issues, pull requests
 and discussions. For places that do not, `--png` also renders every chart

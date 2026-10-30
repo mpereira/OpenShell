@@ -35,14 +35,33 @@ COLLAPSE_AFTER = 3
 MAX_POINTS = 60
 # Charts shown before the rest fold.
 CHARTS_SHOWN = 2
-# Mermaid gantt tags by instance state; the others take the default look.
+# Mermaid gantt tags by instance state; flow rows and other states are plain
+# bars. `Created` and `Succeeded` are points in time, drawn as diamonds.
 TAG = {
-    "Running": "active",
-    "Succeeded": "done",
-    "Unknown": "crit",
-    "Failed": "crit",
-    "Error": "crit",
+    "Created": ["milestone"],
+    "Running": ["active"],
+    "Pending": ["done"],
+    "Unknown": ["crit"],
+    "Failed": ["crit"],
+    "Error": ["crit"],
+    "Succeeded": ["milestone", "active"],
 }
+# The gantt colours, so a state reads the same in every chart: plain bars
+# slate, `active` green, `done` amber, `crit` red, with section stripes in
+# slate and white. No `theme` key, so GitHub keeps its own axis and title
+# colours in light and dark mode. `report.html` draws its lanes in the same
+# colours.
+GANTT_INIT = (
+    '%%{init: {"themeVariables": {'
+    '"taskBkgColor": "#64748b", "taskBorderColor": "#334155", '
+    '"activeTaskBkgColor": "#34d399", "activeTaskBorderColor": "#047857", '
+    '"doneTaskBkgColor": "#fbbf24", "doneTaskBorderColor": "#b45309", '
+    '"critBkgColor": "#dc2626", "critBorderColor": "#7f1d1d", '
+    '"taskTextColor": "#ffffff", "taskTextDarkColor": "#111827", '
+    '"taskTextOutsideColor": "#111827", '
+    '"sectionBkgColor": "#94a3b8", "sectionBkgColor2": "#94a3b8", '
+    '"altSectionBkgColor": "#ffffff"}}}%%'
+)
 # Instances kept first when the chart cannot hold them all: a check failed
 # on them, or they ended badly, then those that went through Unknown.
 ENDED_BADLY = {"Failed", "Error"}
@@ -70,9 +89,13 @@ def _label(text: str) -> str:
 
 
 def _task(label: str, tags: list[str], start: float, end: float, hours: bool) -> str:
+    if "milestone" in tags:
+        # A milestone is drawn at its start, however long the state lasted.
+        end = start
     a, b = _clock(start, hours), _clock(end, hours)
     # A task shorter than a second has no width; a milestone has a diamond.
-    tags = ["milestone", *tags] if a == b else tags
+    if a == b and "milestone" not in tags:
+        tags = ["milestone", *tags]
     return f"    {_label(label)} :{', '.join([*tags, a, b])}"
 
 
@@ -132,6 +155,7 @@ def gantt(data: dict[str, Any]) -> tuple[str, str]:
         str(x) for x in (data["experiment"]["id"], data["run_id"], data["verdict"]) if x
     )
     lines = [
+        GANTT_INIT,
         "gantt",
         f"  title {_label(title)}",
         f"  dateFormat {'HH:mm:ss' if hours else 'mm:ss'}",
@@ -170,10 +194,8 @@ def gantt(data: dict[str, Any]) -> tuple[str, str]:
         budget -= len(ln["segments"])
         lines.append(f"  section {_label(ln['name'])}")
         for seg in ln["segments"]:
-            tag = TAG.get(seg["state"])
-            lines.append(
-                _task(seg["state"], [tag] if tag else [], seg["from"], seg["to"], hours)
-            )
+            tags = TAG.get(seg["state"], [])
+            lines.append(_task(seg["state"], tags, seg["from"], seg["to"], hours))
     note = ""
     if left_out:
         changes = sum(len(ln["segments"]) for ln in left_out)

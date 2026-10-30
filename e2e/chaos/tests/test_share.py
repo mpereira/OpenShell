@@ -13,7 +13,14 @@ from pathlib import Path
 from test_report import TIMELINE, jsonl, run_dir
 
 from chaos.cli import main
-from chaos.share import MAX_POINTS, ROW_BUDGET, flow_spans, gantt, xychart
+from chaos.share import (
+    GANTT_INIT,
+    MAX_POINTS,
+    ROW_BUDGET,
+    flow_spans,
+    gantt,
+    xychart,
+)
 
 NODES = [
     {"t": 0.5, "event": "node.started", "node": "flow.serial"},
@@ -147,7 +154,9 @@ def test_share_page(tmp_path):
     )
     assert "Harness error: adapter said no" in text
     chart = text.split("```mermaid\n")[1].split("```")[0]
-    assert chart.startswith("gantt\n  title demo · r1 · XFAIL\n  dateFormat mm:ss\n")
+    first, rest = chart.split("\n", 1)
+    assert first == GANTT_INIT
+    assert rest.startswith("gantt\n  title demo · r1 · XFAIL\n  dateFormat mm:ss\n")
     assert "  section flow\n    counter :00:00, 00:13\n" in chart
     assert "    wait counter started :00:01, 00:02\n" in chart
     assert "    delay 2s :00:02, 00:04\n" in chart
@@ -155,9 +164,11 @@ def test_share_page(tmp_path):
     assert "    fault gateway-down (outage) :crit, 00:04, 00:09\n" in chart
     assert "\n    gateway-down :" not in chart
     assert "    fault kill-one (kill) :milestone, crit, 00:10, 00:10\n" in chart
-    assert "  section counter-0\n" in chart
+    # Created lasted half a second and Succeeded one; both are diamonds at
+    # their start.
+    assert "  section counter-0\n    Created :milestone, 00:01, 00:01\n" in chart
     assert "    Running :active, 00:02, 00:12\n" in chart
-    assert "    Succeeded :done, 00:12, 00:13\n" in chart
+    assert "    Succeeded :milestone, active, 00:12, 00:12\n" in chart
     assert "would not fit" not in text
     # The metrics table joins the experiment's metric checks to their family.
     assert (
@@ -271,7 +282,9 @@ def test_instances_beyond_the_row_budget_are_left_out():
         ],
     }
     chart, note = gantt(data)
-    sections = [line.split()[1] for line in chart.splitlines() if "section" in line]
+    sections = [
+        line.split()[1] for line in chart.splitlines() if line.startswith("  section ")
+    ]
     # The instance with a failed check, then the one that went Unknown, then
     # the rest in run order, up to the budget.
     assert sections == ["flow", "c-3", "c-5", "c-0"]
@@ -329,3 +342,68 @@ def test_mermaid_numbers_are_plain_decimals(tmp_path):
     sessions = text.split("#### sessions\n")[1].split("####")[0]
     assert "  line [0.000235, 0, 0.00009, 0.0001855, 0, 123500]\n" in sessions
     assert '" 0 --> 135800\n  line [' in sessions
+
+
+def test_gantt_colors_states_with_one_scheme():
+    data = {
+        "experiment": {"id": "x"},
+        "run_id": "r",
+        "verdict": "FAIL",
+        "end": 60.0,
+        "timeline": [],
+        "faults": [],
+        "lanes": [
+            lane("c-0", ["Created", "Running", "Pending", "Running", "Unknown"]),
+            {
+                "name": "c-1",
+                "segments": [
+                    {"from": 0.0, "to": 2.0, "state": "Created"},
+                    {"from": 2.0, "to": 30.0, "state": "Running"},
+                    {"from": 30.0, "to": 40.0, "state": "Failed"},
+                    {"from": 40.0, "to": 40.0, "state": "Failed"},
+                ],
+            },
+        ],
+        "results": [],
+    }
+    chart, _ = gantt(data)
+    lines = chart.splitlines()
+    # No `theme`, so GitHub keeps its own axis colours in dark mode.
+    assert lines[0] == (
+        '%%{init: {"themeVariables": {"taskBkgColor": "#64748b", '
+        '"taskBorderColor": "#334155", "activeTaskBkgColor": "#34d399", '
+        '"activeTaskBorderColor": "#047857", "doneTaskBkgColor": "#fbbf24", '
+        '"doneTaskBorderColor": "#b45309", "critBkgColor": "#dc2626", '
+        '"critBorderColor": "#7f1d1d", "taskTextColor": "#ffffff", '
+        '"taskTextDarkColor": "#111827", "taskTextOutsideColor": "#111827", '
+        '"sectionBkgColor": "#94a3b8", "sectionBkgColor2": "#94a3b8", '
+        '"altSectionBkgColor": "#ffffff"}}}%%'
+    )
+    assert lines[1] == "gantt"
+    assert (
+        "  section c-0\n"
+        + "\n".join(
+            [
+                "    Created :milestone, 00:00, 00:00",
+                "    Running :active, 00:01, 00:02",
+                "    Pending :done, 00:02, 00:03",
+                "    Running :active, 00:03, 00:04",
+                "    Unknown :crit, 00:04, 00:05",
+            ]
+        )
+        in chart
+    )
+    # A Created that lasted two seconds is still one point in time; a Failed
+    # with no length is a red diamond.
+    assert (
+        "  section c-1\n"
+        + "\n".join(
+            [
+                "    Created :milestone, 00:00, 00:00",
+                "    Running :active, 00:02, 00:30",
+                "    Failed :crit, 00:30, 00:40",
+                "    Failed :milestone, crit, 00:40, 00:40",
+            ]
+        )
+        in chart
+    )

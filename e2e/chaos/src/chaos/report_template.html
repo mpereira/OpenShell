@@ -136,11 +136,16 @@ details summary { cursor: pointer; color: var(--text-secondary); margin: 8px 0; 
 const D = JSON.parse(document.getElementById("data").textContent);
 const NS = "http://www.w3.org/2000/svg";
 const LEFT = 132, RIGHT = 16, LANE = 22, LANE_GAP = 6, AXIS = 22;
+// Instance state colours, [fill, border], the same as the gantt in
+// `chaos share` (share.GANTT_INIT): slate, green, amber, red.
+const SLATE = ["#64748b", "#334155"], GREEN = ["#34d399", "#047857"];
+const AMBER = ["#fbbf24", "#b45309"], RED = ["#dc2626", "#7f1d1d"];
 const STATE_COLOR = {
-  Running: "var(--series-1)", Succeeded: "var(--good)", Failed: "var(--critical)",
-  Error: "var(--critical)", Unknown: "var(--warning)", Created: "var(--grid)",
+  Created: SLATE, Running: GREEN, Pending: AMBER, Unknown: RED,
+  Failed: RED, Error: RED, Succeeded: GREEN,
 };
-const stateColor = s => STATE_COLOR[s] || "var(--neutral)";
+const stateColor = s => (STATE_COLOR[s] || SLATE)[0];
+const stateBorder = s => (STATE_COLOR[s] || SLATE)[1];
 const VERDICT = { PASS: ["var(--good)", "PASS"], XFAIL: ["var(--neutral)", "XFAIL (known failures only)"], FAIL: ["var(--critical)", "FAIL"], ERROR: ["var(--warning)", "ERROR"] };
 const tip = document.getElementById("tooltip");
 const crosshairs = [];
@@ -302,10 +307,10 @@ function lanes() {
   const legend = document.getElementById("lane-legend");
   const states = new Set(D.lanes.flatMap(l => l.segments.map(s => s.state)));
   for (const s of ["Created", "Pending", "Running", "Unknown", "Succeeded", "Failed", "Error"]) {
-    if (states.has(s)) legendItem(legend, { background: stateColor(s) }, s);
+    if (states.has(s)) legendItem(legend, { background: stateColor(s), border: `1px solid ${stateBorder(s)}` }, s);
   }
   for (const s of states) {
-    if (!["Created", "Pending", "Running", "Unknown", "Succeeded", "Failed", "Error"].includes(s)) legendItem(legend, { background: stateColor(s) }, s);
+    if (!["Created", "Pending", "Running", "Unknown", "Succeeded", "Failed", "Error"].includes(s)) legendItem(legend, { background: stateColor(s), border: `1px solid ${stateBorder(s)}` }, s);
   }
   if (D.faults.length) legendItem(legend, { background: "var(--band-strong)" }, "fault window (darker on the targeted instances)");
   legendItem(legend, { background: "var(--text-secondary)" }, "harness event", true);
@@ -342,7 +347,7 @@ function lanes() {
     }
     for (const s of row.segments) {
       const x1 = sx.x(s.from), x2 = sx.x(s.to);
-      el("rect", { x: x1, y: y + 4, width: Math.max(1, x2 - x1 - 2), height: LANE - 8, rx: 3, fill: stateColor(s.state) }, plot);
+      el("rect", { x: x1, y: y + 4, width: Math.max(1, x2 - x1 - 2), height: LANE - 8, rx: 3, fill: stateColor(s.state), stroke: stateBorder(s.state), "stroke-width": 1 }, plot);
     }
     for (const m of row.marks) {
       const attrs = m.kind === "docker"
